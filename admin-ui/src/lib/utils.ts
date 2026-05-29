@@ -125,12 +125,18 @@ export function formatNumber(value: number | null | undefined): string {
 
 /**
  * Credit 计费量展示：上游 meteringEvent.usage 是浮点（如 0.0169543），
- * 单位为 "credit"。展示规则：< 1 → 4 位小数；≥ 1 → 走 formatNumber 紧凑模式。
+ * 单位为 "credit"。统一保留 3 位小数；≥ 1000 时走 K/M/B 紧凑模式（compact
+ * notation 自带 1 位小数四舍五入，例如 1,234 → "1.2K"）。
  */
 export function formatCredits(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value) || value <= 0) return '0'
-  if (value < 1) return value.toFixed(4)
-  return formatNumber(value)
+  if (value >= 1000) {
+    return new Intl.NumberFormat('en-US', {
+      notation: 'compact',
+      maximumFractionDigits: 1,
+    }).format(value)
+  }
+  return value.toFixed(3)
 }
 
 /**

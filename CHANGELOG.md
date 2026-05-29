@@ -6,9 +6,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-05-29
+## [0.5.1] - 2026-05-29
 
 主题：彻底重构 prompt cache 与计费指标——上游 `meteringEvent` 实测只下发 `credit`、不带 token / cache 字段，因此把基础设施收敛到「进程内」：移除 Redis 依赖、按 Anthropic `cache_control` 多断点协议在中转层自建 prompt cache、把 `credit` 作为新维度贯穿后端聚合 → API → 前端。仪表盘同步重做：5 系列图表 + 双 Y 轴 + K/M/B 紧凑数值 + 卡片随时间窗切换。
+
+> 0.5.0 因 Credit 数值显示问题被作废（`formatCredits` 在 `value ≥ 1` 时直接打印完整浮点）；0.5.1 修复该问题并整合所有内容，请所有用户直接升级到 0.5.1，跳过 0.5.0。
 
 ### 💥 Breaking — 基础设施
 
@@ -36,7 +38,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Token 使用趋势图重做**（`time-series-chart.tsx`）：5 系列折线（Input / Output / Cache Creation / Cache Read / Cache Hit Rate），双 Y 轴：左轴 token 量级（紧凑 K/M/B），右轴 0–100% 命中率（紫色虚线，刻度固定 [0, 20, 40, 60, 80, 100]）；自定义深色 Tooltip，命中率 = `cacheRead / (input + cacheRead)`。全零数据时左轴强制显示 `0` 刻度，避免空白图表；Legend 改空心圆 + 英文标签。
 - **顶部卡片随时间窗切换**：之前调用 / Token 卡片永远显示「今日」，新增 `useMemo` 把当前 `seriesData` 按 24h / 7d / 30d 聚合，标题动态变成"近 24 小时调用 / 输入 Token"等。`activeClientKeys` 仍是当前活跃数。
-- **数值紧凑格式 K/M/B**：新增 `formatNumber()` 工具（基于 `Intl.NumberFormat` compact notation），覆盖概览卡片 / 模型表 / 凭据柱图 / 时序图 / 凭据列表 Badge。`formatCredits()` 处理 < 1 的小数 credit。Y 轴 / Tooltip / 表格全走同一格式器。
+- **数值紧凑格式 K/M/B**：新增 `formatNumber()` 工具（基于 `Intl.NumberFormat` compact notation），覆盖概览卡片 / 模型表 / 凭据柱图 / 时序图 / 凭据列表 Badge。`formatCredits()` 对 credit 浮点专用：`≤ 0` → `"0"`、`< 1000` → 3 位小数、`≥ 1000` → K/M/B。Y 轴 / Tooltip / 表格全走同一格式器。
 - **凭据柱图按 email 显示**：之前 X 轴 label 是 `#id`（email 字段始终空），后端 `stats_by_credential` 在 handler 拼装时已经反查注入了 `email`，前端改为以 email 为主、`#id` 兜底；过长 email 截断到 22 字符（保留 @domain），完整 email 在 Tooltip 显示。
 
 ### ✨ 新功能 — KAM 凭据导出
@@ -47,6 +49,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 🛠 修复
 
+- **Credit 数值小数位失控（0.5.0 → 0.5.1）**：`formatCredits()` 中 `value ≥ 1` 的分支会回退到 `formatNumber`，而 `formatNumber` 对 `< 1000` 的数直接 `String(value)`，导致 `1.5755479141293534` 这类长浮点被原样打印。修复后统一规则：
+  - `≤ 0 / null / NaN` → `"0"`
+  - `0 < value < 1000` → 保留 3 位小数（`1.576` / `0.017`）
+  - `value ≥ 1000` → `Intl.NumberFormat` compact notation（`1.2K` / `3.4M`）
 - **重启后用量统计丢失**：根因是当 `--credentials credentials.json`（无目录前缀）启动时，`PathBuf::from("credentials.json").parent()` 返回 `Some("")`，导致 `cache_dir = ""`：`UsageRecorder` 把 `usage_log.*.jsonl` 写到 CWD（路径无前缀），`UsageAggregator::rebuild_from_logs("")` 调用 `read_dir("")` 失败，重启后历史记录看似全丢。修复：`MultiTokenManager::cache_dir()` 与 `UsageRecorder::new` / `rebuild_from_logs` 都把空路径归一为 `.`，并把"创建目录失败 / 读取目录失败"由静默 `_` 改成 `tracing::warn!` 显式打印路径。重建完成日志带上目录与条目数。
 - **`StatsResponse` 不再有 `let mut overview = ...` + `let _ = (&mut overview).today_calls;` 这种 dead-code 黑魔法**——直接用不可变 `overview`。
 
@@ -67,6 +73,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 2. **删除过时配置**：编辑 `data/config.json`，删除 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 三个字段（保留也只是被忽略，不会报错）。
 3. **下游客户端**：响应里的 `cache_creation_input_tokens` / `cache_read_input_tokens` 字段含义变了——现在反映的是中转层提示词缓存而非上游缓存。如果下游用这两个字段做计费对账，需要重新理解口径（中转层缓存命中并不会减少上游 credit 消耗，是 SDK 体验优化）。
 4. **历史用量**：`usage_log.*.jsonl` 的旧记录会被自动加载（`credits` 字段缺失时默认 0），重启不丢趋势。新的请求开始会带 credit。
+5. **若你已经升级到 0.5.0**：直接升 0.5.1；不需要清理任何状态文件。
 
 ## [0.4.0] - 2026-05-22
 
