@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { toast } from 'sonner'
-import { ExternalLink, CheckCircle, Loader2 } from 'lucide-react'
+import { ExternalLink, CheckCircle, Loader2, Copy, Check } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -51,6 +51,8 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
   const [step, setStep] = useState<Step>('form')
   const [priority, setPriority] = useState('0')
   const [email, setEmail] = useState('')
+  const [incognito, setIncognito] = useState(false)
+  const [copied, setCopied] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
   const [isCompleting, setIsCompleting] = useState(false)
   const [session, setSession] = useState<StartSocialLoginResponse | null>(null)
@@ -74,13 +76,27 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       setIsStarting(false)
       setIsCompleting(false)
       setCallbackUrl('')
+      setCopied(false)
     }
     onOpenChange(v)
   }
 
+  const handleCopyLink = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url)
+      setCopied(true)
+      toast.success('登录链接已复制，请在无痕窗口粘贴打开')
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      toast.error('复制失败，请手动选中链接复制')
+    }
+  }
+
   const handleStart = async () => {
     setIsStarting(true)
-    const loginWindow = window.open('about:blank', '_blank')
+    // 无痕模式：浏览器不允许 JS 直接开无痕窗口，改为复制链接让用户手动在无痕窗口打开，
+    // 因此不预开 about:blank（避免在当前登录态里误开）。
+    const loginWindow = incognito ? null : window.open('about:blank', '_blank')
     try {
       const resp = await startSocialLogin({
         priority: parseInt(priority) || 0,
@@ -88,7 +104,10 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       })
       setSession(resp)
       setStep('waiting')
-      if (loginWindow) {
+      if (incognito) {
+        // 无痕：复制链接到剪贴板，由用户手动在无痕窗口打开
+        await handleCopyLink(resp.portalUrl)
+      } else if (loginWindow) {
         loginWindow.location.href = resp.portalUrl
       } else {
         window.open(resp.portalUrl, '_blank')
@@ -190,25 +209,63 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                 />
               </div>
             </div>
+            <label className="flex items-start gap-2 rounded-lg border bg-muted/40 p-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={incognito}
+                onChange={(e) => setIncognito(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+              />
+              <span className="text-sm">
+                <span className="font-medium">使用无痕窗口登录</span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  发起后复制登录链接，自行用浏览器无痕/隐身窗口（Ctrl+Shift+N）打开，
+                  避免与当前已登录的 Google / GitHub 账号串号。
+                </span>
+              </span>
+            </label>
           </div>
         )}
 
         {step === 'waiting' && session && (
           <div className="space-y-4 py-2">
-            <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
-              <p className="text-sm text-muted-foreground">
-                浏览器应已自动打开 Kiro 登录页，请完成授权。
-              </p>
-              <a
-                href={session.portalUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-sm font-medium text-primary hover:underline"
-              >
-                重新打开登录页
-                <ExternalLink className="h-3.5 w-3.5" />
-              </a>
-            </div>
+            {incognito ? (
+              <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  登录链接已复制。请新开一个<span className="font-medium text-foreground">无痕 / 隐身窗口</span>
+                  （Ctrl+Shift+N，Safari 为 ⌘+Shift+N），粘贴打开并完成授权。
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleCopyLink(session.portalUrl)}
+                  >
+                    {copied ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                    {copied ? '已复制' : '复制登录链接'}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  浏览器应已自动打开 Kiro 登录页，请完成授权。
+                </p>
+                <a
+                  href={session.portalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-sm font-medium text-primary hover:underline"
+                >
+                  重新打开登录页
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              </div>
+            )}
 
             {isRemote ? (
               // 远程模式：OAuth 回调到 localhost 无法自动捕获，需用户手动复制 URL
