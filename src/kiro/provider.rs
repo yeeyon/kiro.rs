@@ -613,6 +613,28 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
+            // 524 / gateway timeout：上游边缘层超时，继续在本次请求内重试通常只会
+            // 放大客户端等待时间和 Claude 端 Retrying 轮数；快速返回，让客户端下一次调用
+            // 重新建连。
+            if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
+                tracing::warn!(
+                    "API 请求失败（上游网关超时，不重试）: {} {}",
+                    status,
+                    body
+                );
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
+                );
+                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+            }
+
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {

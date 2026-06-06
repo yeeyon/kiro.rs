@@ -80,6 +80,14 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_client_validation_error(&self, body: &str) -> bool {
         default_is_client_validation_error(body)
     }
+
+    /// 判断响应体是否表示上游网关超时。
+    ///
+    /// 524 通常来自 Cloudflare/边缘层，继续在同一次客户端调用里重试会把等待时间
+    /// 放大到客户端自己的重试上限；让调用方快速失败更利于下一次请求重新建连。
+    fn is_gateway_timeout(&self, body: &str) -> bool {
+        default_is_gateway_timeout(body)
+    }
 }
 
 /// 装饰请求时可用的上下文
@@ -146,6 +154,15 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 pub fn default_is_account_throttled(body: &str) -> bool {
     body.contains("suspicious activity")
         && body.contains("temporary limits")
+}
+
+/// 默认的上游网关超时判断逻辑。
+pub fn default_is_gateway_timeout(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    body.contains("524")
+        && (lower.contains("status code")
+            || lower.contains("gateway timeout")
+            || lower.contains("server-side issue"))
 }
 
 /// 触发"客户端请求格式错误 → 立即终止、不重试"的精确 reason 取值集合
@@ -253,6 +270,17 @@ mod tests {
         ));
         // 仅有一半关键词时也不命中
         assert!(!default_is_account_throttled("suspicious activity detected"));
+    }
+
+    #[test]
+    fn test_default_is_gateway_timeout() {
+        assert!(default_is_gateway_timeout(
+            "API Error: 524 status code (no body). This is a server-side issue"
+        ));
+        assert!(default_is_gateway_timeout("524 Gateway Timeout"));
+        assert!(!default_is_gateway_timeout(
+            r#"{"message":"some unrelated field mentions 524 tokens"}"#
+        ));
     }
 
     #[test]

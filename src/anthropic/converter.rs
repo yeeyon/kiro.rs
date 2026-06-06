@@ -190,6 +190,19 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
+/// Whether this request should use `additionalModelRequestFields.output_config`.
+///
+/// The field is currently only known to be accepted by the Opus 4.6 adaptive-thinking path.
+/// Sending it to other models causes upstream 400 responses such as
+/// `additionalModelRequestFields is not supported for this model`.
+fn should_emit_additional_model_request_fields(req: &MessagesRequest, model_id: &str) -> bool {
+    model_id == "claude-opus-4.6"
+        && req
+            .thinking
+            .as_ref()
+            .is_some_and(|t| t.thinking_type == "adaptive")
+}
+
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
@@ -403,27 +416,35 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         );
     }
 
-    // 14. Extract effort into AdditionalModelRequestFields (a real Kiro CLI wire field)
+    // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
     //
-    // The AWS Q backend's real protocol uses `additionalModelRequestFields.output_config.effort`,
-    // which is not the same thing as stuffing a `<thinking_effort>` XML tag into the system prompt.
-    // The client-supplied `req.output_config.effort` is translated here into the real protocol field,
-    // while the existing XML prefix logic (generate_thinking_prefix) is left unchanged,
-    // so sending both yields the strongest effect (measured to roughly 4x the thinking depth of sending only one).
-    // The effort value is passed through verbatim: whatever tier the client sends is translated into the protocol field, with no literal substitution.
-    // Only emit the field when the client actually provided a non-empty effort tier,
-    // so the documented "not sent when empty" contract holds.
+    // The system-prompt thinking prefix remains available for every thinking mode. The real
+    // wire field is narrower: newer/non-adaptive models reject it with
+    // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
+    // by upstream model capability rather than by the mere presence of client output_config.
     let additional_model_request_fields =
-        req.output_config.as_ref().and_then(|oc| {
-            if oc.effort.trim().is_empty() {
-                return None;
-            }
-            Some(AdditionalModelRequestFields {
-                output_config: Some(KiroOutputConfig {
-                    effort: oc.effort.clone(),
-                }),
+        if should_emit_additional_model_request_fields(req, &model_id) {
+            req.output_config.as_ref().and_then(|oc| {
+                if oc.effort.trim().is_empty() {
+                    return None;
+                }
+                Some(AdditionalModelRequestFields {
+                    output_config: Some(KiroOutputConfig {
+                        effort: oc.effort.clone(),
+                    }),
+                })
             })
-        });
+        } else {
+            if let Some(oc) = &req.output_config
+                && !oc.effort.trim().is_empty()
+            {
+                tracing::debug!(
+                    model_id = %model_id,
+                    "skipping unsupported additionalModelRequestFields for model"
+                );
+            }
+            None
+        };
 
     Ok(ConversionResult {
         conversation_state,
@@ -1167,6 +1188,76 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig};
+
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    fn minimal_adaptive_thinking_request_with_output_config(model: &str) -> MessagesRequest {
+        use super::super::types::Thinking;
+
+        let mut req = minimal_request_with_output_config(model);
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20000,
+        });
+        req
+    }
+
+    #[test]
+    fn test_output_config_does_not_emit_unsupported_additional_fields() {
+        let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
+        let result = convert_request(&req).unwrap();
+
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "sonnet 4.8 rejects additionalModelRequestFields even when the client sends output_config"
+        );
+    }
+
+    #[test]
+    fn test_output_config_does_not_emit_for_non_adaptive_opus_4_6() {
+        let req = minimal_request_with_output_config("claude-opus-4-6");
+        let result = convert_request(&req).unwrap();
+
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "opus 4.6 only uses additionalModelRequestFields for adaptive thinking"
+        );
+    }
+
+    #[test]
+    fn test_output_config_emits_additional_fields_for_opus_4_6() {
+        let req = minimal_adaptive_thinking_request_with_output_config("claude-opus-4-6-thinking");
+        let result = convert_request(&req).unwrap();
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.6 adaptive thinking should keep the real effort field");
+        assert_eq!(
+            fields.output_config.unwrap().effort,
+            "high",
+            "effort should be passed through for the supported model"
+        );
     }
 
     #[test]

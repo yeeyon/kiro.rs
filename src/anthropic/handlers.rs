@@ -574,9 +574,8 @@ pub async fn post_messages(
         }
     };
 
-    // Build the Kiro request (profile_arn is injected by the provider layer from the actual credentials;
-    // additional_model_request_fields comes from the client's output_config and is the real protocol field
-    // by which the AWS Q backend recognizes effort; sending it alongside the XML prefix yields the strongest effect)
+    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
+    // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -1228,9 +1227,8 @@ pub async fn post_messages_cc(
         }
     };
 
-    // Build the Kiro request (profile_arn is injected by the provider layer from the actual credentials;
-    // additional_model_request_fields comes from the client's output_config and is the real protocol field
-    // by which the AWS Q backend recognizes effort; sending it alongside the XML prefix yields the strongest effect)
+    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
+    // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
