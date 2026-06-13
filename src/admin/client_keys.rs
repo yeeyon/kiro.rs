@@ -55,6 +55,10 @@ pub struct ClientKey {
     /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
+    /// 老数据无此字段，默认 false。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_system: bool,
 }
 
 /// 客户端 Key 管理器
@@ -146,14 +150,34 @@ impl ClientKeyManager {
     }
 
     /// 创建新 Key（生成明文随机串），返回新建条目
-    pub fn create(&self, name: String, description: Option<String>, group: Option<String>) -> ClientKey {
-        let key = generate_client_key();
+    pub fn create(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+    ) -> ClientKey {
+        self.create_with_key(name, description, group, generate_client_key())
+    }
+
+    /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
+    /// 若该明文已存在则跳过，返回已存在的条目。
+    pub fn create_with_key(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        plaintext: String,
+    ) -> ClientKey {
         let mut inner = self.inner.write();
+        // 防止 bootstrap 重复导入同一明文
+        if let Some(&id) = inner.by_key.get(&plaintext) {
+            return inner.entries.get(&id).cloned().expect("by_key 与 entries 应一致");
+        }
         let id = inner.next_id;
         inner.next_id += 1;
         let entry = ClientKey {
             id,
-            key: key.clone(),
+            key: plaintext.clone(),
             name,
             description,
             disabled: false,
@@ -166,15 +190,94 @@ impl ClientKeyManager {
             total_cache_read_tokens: 0,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
+            is_system: false,
         };
-        inner.by_key.insert(key, id);
+        inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
         self.save_locked(&inner);
         entry
     }
 
+    /// 确保 config.json apiKey 对应的系统 Key 存在（幂等，每次启动调用）。
+    ///
+    /// 系统 Key **固定占用 id=0**：历史 master apiKey 的用量数据都记在 keyId=0 桶里，
+    /// 固定 id=0 可让「默认密钥」直接查到升级前的全部用量，保证数据连续。
+    ///
+    /// - 若该明文已在 id=0：确保 is_system=true（no-op）。
+    /// - 若该明文在其它 id（旧版 bootstrap 误建）：迁移到 id=0。
+    /// - 明文不存在：在 id=0 新建（id=0 被占用时回退 next_id，极罕见）。
+    /// 系统 Key 不可删除；可轮换（轮换时同步 config.apiKey）。
+    pub fn ensure_system_key(&self, name: String, description: Option<String>, plaintext: String) {
+        let mut inner = self.inner.write();
+        match inner.by_key.get(&plaintext).copied() {
+            Some(0) => {
+                // 已在 id=0：确保 is_system
+                if let Some(e) = inner.entries.get_mut(&0) {
+                    if !e.is_system {
+                        e.is_system = true;
+                        self.save_locked(&inner);
+                    }
+                }
+            }
+            Some(other) => {
+                // 明文在非 0 id 上：尽量迁移到 id=0（对齐历史 keyId=0 用量）
+                if !inner.entries.contains_key(&0) {
+                    let mut entry = inner
+                        .entries
+                        .remove(&other)
+                        .expect("by_key 与 entries 应一致");
+                    entry.id = 0;
+                    entry.is_system = true;
+                    inner.entries.insert(0, entry);
+                    inner.by_key.insert(plaintext, 0);
+                    self.save_locked(&inner);
+                } else if let Some(e) = inner.entries.get_mut(&other) {
+                    // id=0 被别的 Key 占用：仅在原位标记 system
+                    if !e.is_system {
+                        e.is_system = true;
+                        self.save_locked(&inner);
+                    }
+                }
+            }
+            None => {
+                // 明文不存在：在 id=0 新建（占用则回退 next_id）
+                let id = if !inner.entries.contains_key(&0) {
+                    0
+                } else {
+                    let id = inner.next_id;
+                    inner.next_id += 1;
+                    id
+                };
+                let entry = ClientKey {
+                    id,
+                    key: plaintext.clone(),
+                    name,
+                    description,
+                    disabled: false,
+                    created_at: Utc::now().to_rfc3339(),
+                    last_used_at: None,
+                    total_calls: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    total_cache_creation_tokens: 0,
+                    total_cache_read_tokens: 0,
+                    total_credits: 0.0,
+                    group: None,
+                    is_system: true,
+                };
+                inner.by_key.insert(plaintext, id);
+                inner.entries.insert(id, entry);
+                self.save_locked(&inner);
+            }
+        }
+    }
+
     pub fn delete(&self, id: u64) -> bool {
         let mut inner = self.inner.write();
+        // 系统 Key 拒绝删除
+        if inner.entries.get(&id).map(|e| e.is_system).unwrap_or(false) {
+            return false;
+        }
         let removed = match inner.entries.remove(&id) {
             Some(e) => {
                 inner.by_key.remove(&e.key);
@@ -261,6 +364,16 @@ impl ClientKeyManager {
             .count()
     }
 
+    /// 指定 id 的 Key 是否为系统 Key（不存在也返回 false）。
+    pub fn is_system(&self, id: u64) -> bool {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.is_system)
+            .unwrap_or(false)
+    }
+
     /// 把所有引用 `old` 的 Key 的 group 字段改为 `new`（分组改名级联用）。
     /// 返回受影响的 Key 数。
     pub fn rename_group(&self, old: &str, new: &str) -> usize {
@@ -295,16 +408,17 @@ impl ClientKeyManager {
         affected
     }
 
-    /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled。
+    /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled/is_system。
     /// 用于「明文遗失」「下游怀疑泄漏」场景，比删后重建更安全（不会丢统计与分组绑定）。
-    /// 命中且替换成功时返回新条目（含新明文）；id 不存在时返回 None。
+    /// 命中且替换成功返回新条目（含新明文）；id 不存在返回 None。
+    /// 注意：系统 Key 轮换后调用方需把新明文同步写回 config.json apiKey，避免下次启动重复导入。
     pub fn rotate(&self, id: u64) -> Option<ClientKey> {
         let new_key = generate_client_key();
         let mut inner = self.inner.write();
         // 取出旧条目并从 by_key 索引摘除
         let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
         inner.by_key.remove(&old_key);
-        // 写入新明文 + 索引
+        // 写入新明文 + 索引（is_system 等其余字段保留不变）
         let entry = inner.entries.get_mut(&id)?;
         entry.key = new_key.clone();
         let snapshot = entry.clone();
@@ -397,6 +511,11 @@ impl Default for ClientKeyManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// serde 辅助：bool 为 false 时跳过序列化
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
@@ -501,5 +620,37 @@ mod tests {
     fn rotate_unknown_id_returns_none() {
         let mgr = ClientKeyManager::new();
         assert!(mgr.rotate(999).is_none());
+    }
+
+    #[test]
+    fn ensure_system_key_uses_id_zero() {
+        let mgr = ClientKeyManager::new();
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        // 系统密钥固定在 id=0，对齐历史 keyId=0 用量桶
+        assert!(mgr.is_system(0));
+        assert_eq!(mgr.list().first().map(|k| k.id), Some(0));
+        // 幂等：再次调用不重复创建
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert_eq!(mgr.list().iter().filter(|k| k.is_system).count(), 1);
+    }
+
+    #[test]
+    fn ensure_system_key_migrates_misplaced_id_to_zero() {
+        // 模拟旧版 bootstrap 把 apiKey 误建在 id=1 上的场景
+        let mgr = ClientKeyManager::new();
+        mgr.create_with_key("默认密钥".into(), None, None, "sk-kiro-abc".into());
+        assert_eq!(mgr.list().first().map(|k| k.id), Some(1));
+        // 修复后启动：应迁移到 id=0
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert!(mgr.is_system(0));
+        assert!(!mgr.list().iter().any(|k| k.id == 1 && k.key == "sk-kiro-abc"));
+    }
+
+    #[test]
+    fn system_key_cannot_be_deleted() {
+        let mgr = ClientKeyManager::new();
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert!(!mgr.delete(0), "系统密钥 id=0 不可删除");
+        assert!(mgr.is_system(0));
     }
 }

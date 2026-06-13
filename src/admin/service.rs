@@ -1069,6 +1069,18 @@ impl AdminService {
         Ok(())
     }
 
+    /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）
+    pub fn persist_admin_key(&self, new_key: &str) {
+        let key = new_key.to_string();
+        self.update_config_file(move |c| c.admin_api_key = Some(key));
+    }
+
+    /// 持久化新的 apiKey（系统密钥轮换后同步 config.json，保证下次启动不重复导入）
+    pub fn persist_api_key(&self, new_key: &str) {
+        let key = new_key.to_string();
+        self.update_config_file(move |c| c.api_key = Some(key));
+    }
+
     /// 获取在线更新配置（GitHub Token 只返回是否已配置）
     pub fn get_update_config(&self) -> UpdateConfigResponse {
         self.update_config.lock().response()

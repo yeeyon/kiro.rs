@@ -187,7 +187,6 @@ function useOverviewFilters() {
 
 function selectedStatsKeyLabel(keyFilter: string, keys: ClientKeyItem[]): string {
   if (keyFilter === 'all') return '全部入口 Key'
-  if (keyFilter === '0') return '管理员API密钥'
   return keys.find((k) => String(k.id) === keyFilter)?.name ?? `#${keyFilter}`
 }
 
@@ -310,7 +309,6 @@ function KeyFilterCard({
               </SelectTrigger>
               <SelectContent align="end">
                 <SelectItem value="all">全部入口 Key</SelectItem>
-                <SelectItem value="0">管理员API密钥</SelectItem>
                 {keys.map((key) => (
                   <SelectItem key={key.id} value={String(key.id)}>
                     {key.name}

@@ -125,7 +125,6 @@ function credLabel(id: number, email?: string | null): string {
 
 function keyLabel(keyId: number, keyName?: string | null): string {
   if (keyName) return keyName
-  if (keyId === 0) return '管理员API密钥'
   return `#${keyId}`
 }
 
@@ -488,7 +487,6 @@ export function TraceLogPage() {
   const { data: keysData } = useClientKeys()
   const keyOptions = [
     { value: '', label: '全部 Key' },
-    { value: '0', label: '管理员API密钥' },
     ...(keysData?.keys ?? []).map((k) => ({ value: String(k.id), label: k.name })),
   ]
 

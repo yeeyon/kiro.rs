@@ -21,7 +21,7 @@ use super::{
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
@@ -683,6 +683,34 @@ pub async fn poll_idc_relogin(
     }
 }
 
+/// PUT /api/admin/config/admin-key
+/// 修改登录API密钥（adminApiKey）并持久化到配置文件。
+/// 该 key 用于管理面板登录，修改后立即生效。
+pub async fn update_admin_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateAdminKeyRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    let new_key = payload.new_key.trim().to_string();
+    if new_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "新登录API密钥不能为空",
+            )),
+        )
+            .into_response();
+    }
+
+    // 更新内存中的登录API密钥
+    *state.admin_api_key.write() = new_key.clone();
+
+    // 通过 service 持久化到 config.json（从磁盘加载最新后再写，避免覆盖其他字段）
+    state.service.persist_admin_key(&new_key);
+
+    Json(SuccessResponse::new("登录API密钥已更新")).into_response()
+}
+
 // ============ 客户端 API Key 分发 ============
 
 fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
@@ -700,6 +728,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
         group: k.group.clone(),
+        is_system: k.is_system,
     }
 }
 
@@ -755,6 +784,15 @@ pub async fn delete_client_key(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+    if state.client_keys.is_system(id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "系统密钥（config.json apiKey）不可删除",
+            )),
+        )
+            .into_response();
+    }
     if state.client_keys.delete(id) {
         Json(SuccessResponse::new(format!("Key #{} 已删除", id))).into_response()
     } else {
@@ -851,13 +889,20 @@ pub async fn rotate_client_key(
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
     match state.client_keys.rotate(id) {
-        Some(entry) => Json(CreateClientKeyResponse {
-            id: entry.id,
-            key: entry.key,
-            name: entry.name,
-            created_at: entry.created_at,
-        })
-        .into_response(),
+        Some(entry) => {
+            // 系统密钥轮换后明文变了，需同步写回 config.json apiKey，
+            // 否则下次启动 ensure_system_key 会因旧 apiKey 不在列表而重复导入。
+            if entry.is_system {
+                state.service.persist_api_key(&entry.key);
+            }
+            Json(CreateClientKeyResponse {
+                id: entry.id,
+                key: entry.key,
+                name: entry.name,
+                created_at: entry.created_at,
+            })
+            .into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(super::types::AdminErrorResponse::not_found(format!(
@@ -1136,17 +1181,13 @@ pub async fn list_traces(
         .into_iter()
         .map(|k| (k.id, k.name))
         .collect();
-    // 客户端 Key 名称解析：master apiKey (key_id=0) 在前端显示为"管理员API密钥"，
-    // 其余客户端 Key 命中名称表则取名称、未命中则回退 #id。
+    // 入口 Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
+    // （master apiKey 已下线，历史 key_id=0 记录会显示为 #0）
     let key_label = |key_id: u64| -> String {
-        if key_id == 0 {
-            "管理员API密钥".to_string()
-        } else {
-            client_key_name_map
-                .get(&key_id)
-                .cloned()
-                .unwrap_or_else(|| format!("#{}", key_id))
-        }
+        client_key_name_map
+            .get(&key_id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", key_id))
     };
 
     let enriched: Vec<serde_json::Value> = records

@@ -638,6 +638,16 @@ pub struct UpdateCheckInfo {
     pub warning: Option<String>,
 }
 
+// ============ 登录API密钥修改 ============
+
+/// 修改登录API密钥（管理面板登录用 adminApiKey）请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAdminKeyRequest {
+    /// 新的登录API密钥
+    pub new_key: String,
+}
+
 // ============ 客户端 API Key 分发 ============
 
 /// 客户端 Key 列表项（脱敏展示）
@@ -661,6 +671,9 @@ pub struct ClientKeyItem {
     pub total_cache_read_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 /// 客户端 Key 列表响应

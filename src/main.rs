@@ -91,7 +91,7 @@ async fn main() {
     );
 
     // apiKey 仅用于首次启动时 bootstrap 第一条客户端 Key；
-    // 后续认证全部走客户端 Key 系统。
+    // 后续 /v1 认证全部走客户端 Key 系统。adminApiKey 仍是管理面板登录密钥。
     let bootstrap_key = config.api_key.clone().filter(|k| !k.trim().is_empty());
 
     // 构建代理配置
@@ -242,22 +242,14 @@ async fn main() {
         });
     }
 
-    // 首次启动：若客户端 Key 为空，用 config.apiKey 自动创建第一条 Key
-    if client_key_manager.list().is_empty() {
-        if let Some(ref initial_key) = bootstrap_key {
-            client_key_manager.create(
-                "默认密钥".to_string(),
-                Some("由 config.json apiKey 自动导入".to_string()),
-                None,
-            );
-            tracing::info!("已从 config.json apiKey bootstrap 第一条客户端 Key：默认密钥");
-            // 让 bootstrap 后的 key 值就是 config 中的 apiKey
-            // create 会随机生成，所以我们需要用 rotate 逻辑来覆盖。实际上 create 返回的 key
-            // 是随机值，不能直接注入。改为手动插入一条明文等于 bootstrap_key 的记录。
-            let _ = initial_key; // 暂时忽略，走 create 随机生成。用户可从管理页复制明文后更新。
-        } else {
-            tracing::warn!("客户端 Key 为空且未配置 apiKey，请尽快通过管理页创建第一条 Key");
-        }
+    // 每次启动幂等确保 config.apiKey 对应的系统 Key 存在（不可删除 / 不可轮换）。
+    // 老部署升级时会把已有的 apiKey 补成系统 Key，保证根密钥始终可用于 /v1 流量。
+    if let Some(initial_key) = bootstrap_key.as_ref() {
+        client_key_manager.ensure_system_key(
+            "默认密钥".to_string(),
+            Some("由 config.json apiKey 自动导入（系统密钥）".to_string()),
+            initial_key.clone(),
+        );
     }
 
     // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
@@ -277,53 +269,62 @@ async fn main() {
         trace_store.clone(),
     );
 
-    // 构建 Admin API 路由（只要 client_keys 可用就启用）
-    let app = {
-        // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
-        let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
-            std::sync::Arc::new(
-                admin::TraceStore::open_in_memory()
-                    .expect("内存 trace store 初始化失败"),
-            )
-        });
-        let admin_service =
-            admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
-                .with_log_governance(
-                    Some(admin_trace_store.clone()),
-                    Some(usage_recorder.clone()),
-                );
-        let admin_state = admin::AdminState::new(
-            admin_service,
-            client_key_manager.clone(),
-            usage_aggregator.clone(),
-            admin_trace_store,
-            group_manager.clone(),
-        );
+    // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
+    // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
+    let app = if let Some(admin_key) = &config.admin_api_key {
+        if admin_key.trim().is_empty() {
+            tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
+            anthropic_app
+        } else {
+            // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
+            let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
+                std::sync::Arc::new(
+                    admin::TraceStore::open_in_memory()
+                        .expect("内存 trace store 初始化失败"),
+                )
+            });
+            let admin_service =
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_log_governance(
+                        Some(admin_trace_store.clone()),
+                        Some(usage_recorder.clone()),
+                    );
+            let admin_state = admin::AdminState::new(
+                admin_key,
+                admin_service,
+                client_key_manager.clone(),
+                usage_aggregator.clone(),
+                admin_trace_store,
+                group_manager.clone(),
+            );
 
-        // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
-        admin_state
-            .service
-            .start_balance_refresher(std::time::Duration::from_secs(300));
+            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
+            admin_state
+                .service
+                .start_balance_refresher(std::time::Duration::from_secs(300));
 
-        // 启动代理池健康检查调度器（每 5 分钟一次）
-        admin_state
-            .service
-            .start_proxy_health_checker(std::time::Duration::from_secs(300));
+            // 启动代理池健康检查调度器（每 5 分钟一次）
+            admin_state
+                .service
+                .start_proxy_health_checker(std::time::Duration::from_secs(300));
 
-        // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
-        // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
-        admin_state.service.start_auto_update_scheduler();
+            // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
+            // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
+            admin_state.service.start_auto_update_scheduler();
 
-        let admin_app = admin::create_admin_router(admin_state);
+            let admin_app = admin::create_admin_router(admin_state);
 
-        // 创建 Admin UI 路由
-        let admin_ui_app = admin_ui::create_admin_ui_router();
+            // 创建 Admin UI 路由
+            let admin_ui_app = admin_ui::create_admin_ui_router();
 
-        tracing::info!("Admin API 已启用");
-        tracing::info!("Admin UI 已启用: /admin");
+            tracing::info!("Admin API 已启用");
+            tracing::info!("Admin UI 已启用: /admin");
+            anthropic_app
+                .nest("/api/admin", admin_app)
+                .nest("/admin", admin_ui_app)
+        }
+    } else {
         anthropic_app
-            .nest("/api/admin", admin_app)
-            .nest("/admin", admin_ui_app)
     };
 
     // 启动服务器
@@ -348,8 +349,8 @@ async fn main() {
 
 /// 文件不存在时初始化配置/凭证文件
 ///
-/// - `config.json`：写入带随机 `apiKey` 的最小默认配置（首次启动时会自动导入为第一条客户端 Key），
-///   `host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
+/// - `config.json`：写入带随机 `apiKey`（首次启动自动导入为第一条客户端 Key）/ `adminApiKey`（管理面板登录密钥）
+///   的最小默认配置；`host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
 /// - `credentials.json`：写入空数组 `[]`，便于后续通过 Admin UI 添加凭据。
 ///
 /// 任一步失败都仅打印警告，不中断启动；后续 `Config::load` / `CredentialsConfig::load`
@@ -365,10 +366,12 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
             }
         }
         let api_key = format!("sk-kiro-rs-{}", random_token(24));
+        let admin_api_key = format!("sk-admin-{}", random_token(24));
         let default = serde_json::json!({
             "host": "0.0.0.0",
             "port": 8990,
             "apiKey": api_key,
+            "adminApiKey": admin_api_key,
             "region": "us-east-1",
             "tlsBackend": "rustls",
             "defaultEndpoint": "ide"
@@ -379,7 +382,8 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
-                tracing::info!("  apiKey = {}（首次启动时将自动导入为第一条客户端 Key）", api_key);
+                tracing::info!("  apiKey      = {}（首次启动时将自动导入为第一条客户端 Key）", api_key);
+                tracing::info!("  adminApiKey = {}（管理面板登录密钥）", admin_api_key);
                 tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
             }
             Err(e) => tracing::warn!("写入默认配置失败 {}: {}", config_p.display(), e),

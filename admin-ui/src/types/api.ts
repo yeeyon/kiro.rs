@@ -295,6 +295,11 @@ export interface UpdateCheckInfo {
   warning?: string
 }
 
+// 登录API密钥修改（adminApiKey —— 管理面板登录密钥）
+export interface UpdateAdminKeyRequest {
+  newKey: string
+}
+
 // IdC 设备授权登录
 export interface StartIdcLoginRequest {
   region: string
@@ -360,6 +365,8 @@ export interface ClientKeyItem {
   totalCacheReadTokens: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
+  /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
+  isSystem: boolean
 }
 
 export interface ClientKeysResponse {
@@ -400,7 +407,7 @@ export interface StatsTimeFilter {
 }
 
 export interface StatsFilter {
-  /** 不传 = 全部；0 = 管理员API密钥；其它值 = 创建的客户端 Key id */
+  /** 不传 = 全部；其它值 = 客户端 Key id */
   keyId?: number
   /** 按账号分组筛选（仅影响 timeseries / by-credential，by-model 不支持） */
   group?: string
@@ -469,7 +476,7 @@ export interface TraceRecord {
   traceId: string
   ts: string
   keyId: number
-  /** masterApiKey = 管理员API密钥；clientKey = 创建的客户端 Key */
+  /** masterApiKey = 历史 master 调用（已下线）；clientKey = 客户端 Key */
   keySource: 'masterApiKey' | 'clientKey'
   /** 发起请求的客户端 Key 名称（master 表示主 apiKey；管理员业务 Key 可为 null） */
   keyName?: string | null

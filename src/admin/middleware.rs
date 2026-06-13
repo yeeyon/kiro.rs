@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use axum::{
     body::Body,
     extract::State,
@@ -21,6 +23,8 @@ use crate::common::auth;
 /// Admin API 共享状态
 #[derive(Clone)]
 pub struct AdminState {
+    /// 登录API密钥（管理面板登录用，运行时可修改）
+    pub admin_api_key: Arc<RwLock<String>>,
     /// Admin 服务
     pub service: Arc<AdminService>,
     /// 客户端 Key 管理器（与 anthropic 路由共享）
@@ -35,6 +39,7 @@ pub struct AdminState {
 
 impl AdminState {
     pub fn new(
+        admin_api_key: impl Into<String>,
         service: AdminService,
         client_keys: SharedClientKeyManager,
         usage_aggregator: SharedAggregator,
@@ -42,6 +47,7 @@ impl AdminState {
         groups: SharedGroupManager,
     ) -> Self {
         Self {
+            admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
             service: Arc::new(service),
             client_keys,
             usage_aggregator,
@@ -51,24 +57,20 @@ impl AdminState {
     }
 }
 
-/// Admin API 认证中间件 — 统一走客户端 Key 校验
+/// Admin API 认证中间件 — 校验登录API密钥（adminApiKey）
 pub async fn admin_auth_middleware(
     State(state): State<AdminState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let presented = match auth::extract_api_key(&request) {
-        Some(k) => k,
-        None => {
+    let api_key = auth::extract_api_key(&request);
+
+    let current_key = state.admin_api_key.read().clone();
+    match api_key {
+        Some(key) if auth::constant_time_eq(&key, &current_key) => next.run(request).await,
+        _ => {
             let error = AdminErrorResponse::authentication_error();
-            return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
-    };
-
-    if state.client_keys.verify_and_touch(&presented).is_some() {
-        return next.run(request).await;
     }
-
-    let error = AdminErrorResponse::authentication_error();
-    (StatusCode::UNAUTHORIZED, Json(error)).into_response()
 }

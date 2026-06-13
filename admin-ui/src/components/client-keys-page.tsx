@@ -134,10 +134,13 @@ export function ClientKeysPage() {
   }
 
   const handleRotate = async (item: ClientKeyItem) => {
+    const systemHint = item.isSystem
+      ? '这是系统密钥（config.json apiKey），重新生成后会同步更新 config.json 的 apiKey。'
+      : ''
     if (
       !(await confirm({
         title: '重新生成 Key',
-        description: `重新生成 Key "${item.name}"？旧明文将立即失效，使用旧明文的下游需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。`,
+        description: `重新生成 Key "${item.name}"？旧明文将立即失效，使用旧明文的下游需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
         confirmText: '重新生成',
         destructive: true,
       }))
@@ -147,6 +150,10 @@ export function ClientKeysPage() {
       const res = await rotateKey.mutateAsync(item.id)
       setCreatedKey(res)
       setShowCreatedPlain(true)
+      // 系统密钥轮换后本地存储的 apiKey 已失效，提示用户用新明文重新登录
+      if (item.isSystem) {
+        toast.info('系统密钥已更新，若你正用该密钥登录管理面板，请用新明文重新登录')
+      }
     } catch (err) {
       toast.error('重新生成失败：' + extractErrorMessage(err))
     }
@@ -219,6 +226,7 @@ export function ClientKeysPage() {
             <table className="w-full min-w-[920px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
+                  <th className="text-left font-medium px-4 py-3">ID</th>
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
@@ -233,8 +241,18 @@ export function ClientKeysPage() {
               <tbody>
                 {data.keys.map((k) => (
                   <tr key={k.id} className="border-t border-border/40 whitespace-nowrap">
+                    <td className="px-4 py-3 font-mono text-[12px] text-muted-foreground tabular-nums">
+                      #{k.id}
+                    </td>
                     <td className="px-4 py-3">
-                      <div className="max-w-[220px] truncate font-medium">{k.name}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="max-w-[220px] truncate font-medium">{k.name}</span>
+                        {k.isSystem && (
+                          <Badge variant="secondary" title="由 config.json apiKey 导入，不可删除 / 不可轮换">
+                            系统
+                          </Badge>
+                        )}
+                      </div>
                       {k.description && (
                         <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
                           {k.description}
@@ -309,15 +327,17 @@ export function ClientKeysPage() {
                         >
                           <RotateCcw className="h-3.5 w-3.5" />
                         </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => handleDelete(k)}
-                          title="删除"
-                        >
-                          <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                        </Button>
+                        {!k.isSystem && (
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="h-7 w-7"
+                            onClick={() => handleDelete(k)}
+                            title="删除"
+                          >
+                            <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                          </Button>
+                        )}
                       </div>
                     </td>
                   </tr>

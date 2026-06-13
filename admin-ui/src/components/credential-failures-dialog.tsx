@@ -48,8 +48,7 @@ function formatTime(ts: string): string {
 }
 
 function keySourceLabel(rec: TraceRecord): string {
-  if (rec.keySource === "clientKey") return rec.keyName ?? `#${rec.keyId}`;
-  return "管理员API密钥";
+  return rec.keyName ?? `#${rec.keyId}`;
 }
 
 export function CredentialFailuresDialog({
