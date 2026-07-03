@@ -141,7 +141,10 @@ Complete all chunked operations without commentary.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
+    if model_lower == "auto" {
+        // Kiro-native "auto" mode: upstream picks the model per-task.
+        Some("auto".to_string())
+    } else if model_lower.contains("sonnet") {
         if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-sonnet-4.8".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
@@ -190,7 +193,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-5" =>
+                || mapped == "claude-opus-5"
+                || mapped == "auto" =>
         {
             1_000_000
         }
@@ -1224,6 +1228,11 @@ mod tests {
                 .unwrap()
                 .contains("sonnet")
         );
+    }
+
+    #[test]
+    fn test_map_model_auto() {
+        assert_eq!(map_model("auto"), Some("auto".to_string()));
     }
 
     #[test]

@@ -366,6 +366,15 @@ fn resolve_usage_input_tokens(
 fn available_models() -> Vec<Model> {
     vec![
         Model {
+            id: "auto".to_string(),
+            object: "model".to_string(),
+            created: 1782000000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Auto".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
             created: 1782000000, // Kiro-side next-gen preview, newer than 4.8
@@ -1841,5 +1850,13 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
         assert!(ids.contains(&"claude-sonnet-5"));
+    }
+
+    #[test]
+    fn available_models_include_auto() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.contains(&"auto"));
     }
 }
