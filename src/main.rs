@@ -168,6 +168,11 @@ async fn main() {
     // 初始化自定义模型注册表（启动时装载一次，运行期只读）
     model::custom_models::init(config.custom_models.clone());
 
+    // 模型注册表：先装载配置 override，再后台异步从上游 ListAvailableModels
+    // 学习真实可用模型（新模型免改码即可路由 + 在 /v1/models 广告）。
+    anthropic::model_registry::set_overrides(config.model_registry.clone());
+    anthropic::model_registry::spawn_upstream_refresh(token_manager.clone());
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),

@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
+use super::model_registry;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -522,6 +523,8 @@ fn aggregate_available_models_with_custom(
 
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
     aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
+}
+
 }
 
 /// GET /v1/models
@@ -1399,10 +1402,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    // 哪些模型只接受 adaptive（当前仅 Opus 4.6）由注册表统一裁决，
+    // 避免这里再维护一份版本号判断。
+    let thinking_type = model_registry::thinking_type_for(&payload.model);
 
     tracing::info!(
         model = %payload.model,
@@ -1415,7 +1417,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    // adaptive-only 模型（Opus 4.6）必须同时带上 output_config，否则上游 400。
+    if thinking_type == "adaptive" {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -2141,5 +2144,61 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+
+    /// `/v1/models` 从静态数组换成注册表驱动后，不得丢掉任何一个原先广告的 ID。
+    /// 这是老客户端（写死模型名的脚本 / cc-kiro 探测逻辑）的兼容护栏。
+    #[test]
+    fn available_models_still_covers_every_previously_static_id() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        // 改造前 available_models() 手写的全部 24 条。
+        const LEGACY_STATIC_IDS: &[&str] = &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "claude-fable-5",
+            "claude-fable-5-thinking",
+            "claude-sonnet-5",
+            "claude-sonnet-5-thinking",
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "claude-opus-4-8",
+            "claude-opus-4-8-thinking",
+            "claude-sonnet-4-8",
+            "claude-sonnet-4-8-thinking",
+            "claude-opus-4-7",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-6",
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-thinking",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-5-20251101-thinking",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5-20250929-thinking",
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5-20251001-thinking",
+        ];
+
+        for legacy in LEGACY_STATIC_IDS {
+            assert!(
+                ids.contains(legacy),
+                "{legacy} 曾被静态目录广告，注册表目录不得丢失"
+            );
+        }
+    }
+
+    /// 广告出来的每个 ID 都必须真的能路由（否则客户端选了就 400）。
+    #[test]
+    fn every_advertised_model_is_routable() {
+        for model in available_models() {
+            assert!(
+                super::super::converter::map_model(&model.id).is_some(),
+                "{} 被广告但无法路由",
+                model.id
+            );
+        }
     }
 }

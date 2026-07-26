@@ -26,6 +26,7 @@ pub mod cache_metering;
 mod converter;
 mod handlers;
 mod middleware;
+pub mod model_registry;
 mod openai;
 mod responses;
 mod router;

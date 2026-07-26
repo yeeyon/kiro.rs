@@ -3,6 +3,8 @@
 /AGENTS.md
 /config.json
 /credentials.json
+# 运行时数据目录（含 config.json / credentials.json 明文凭据，绝对不能提交）
+/data/
 /.idea
 /test.json
 /admin-ui/node_modules/
