@@ -721,10 +721,6 @@ fn new_fc_id() -> String {
 fn new_ctc_id() -> String {
     format!("ctc_{}", Uuid::new_v4().to_string().replace('-', ""))
 }
-fn new_rs_id() -> String {
-    format!("rs_{}", Uuid::new_v4().to_string().replace('-', ""))
-}
-
 /// 从自由文本工具的 arguments JSON 里解出原始 input 字符串。
 ///
 /// 回退链：`{"input": <string>}` → 单字段字符串对象 → 原样返回 arguments。
@@ -767,14 +763,10 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
 
     let mut output = Vec::new();
 
-    // 推理摘要放最前（思考先于可见输出发生）
-    if !p.thinking.is_empty() {
-        output.push(json!({
-            "type": "reasoning",
-            "id": new_rs_id(),
-            "summary": [{ "type": "summary_text", "text": p.thinking }],
-        }));
-    }
+    // Kiro's `reasoningContentEvent.text` is raw model reasoning, not a
+    // provider-authored summary. Exposing it as a Responses `reasoning`
+    // summary leaks internal planning (including tool-control notes) into
+    // clients such as Codex, so keep it out of the public Responses output.
 
     // 内部代答的 web_search 以 web_search_call 展示（codex 渲染 "Searched the web"）
     for (id, query) in &p.web_searches {
@@ -1174,7 +1166,6 @@ mod tests {
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
             completion_tokens: 5,
-            thinking: String::new(),
             web_searches: Vec::new(),
         }
     }
@@ -1589,14 +1580,13 @@ mod tests {
     }
 
     #[test]
-    fn build_view_orders_reasoning_search_message_tools() {
+    fn build_view_suppresses_raw_reasoning_and_orders_visible_items() {
         let kinds = kinds_of(&[("shell", DeclaredToolKind::Function)]);
         let mut p = parsed_with_tool_calls(vec![json!({
             "id": "toolu_1", "type": "function",
             "function": { "name": "shell", "arguments": "{}" },
         })]);
         p.text = "answer".to_string();
-        p.thinking = "let me think".to_string();
         p.web_searches = vec![("srvtoolu_1".to_string(), "rust news".to_string())];
         let view = build_view(&p, &kinds);
         let types: Vec<&str> = view
@@ -1604,15 +1594,15 @@ mod tests {
             .iter()
             .map(|i| i["type"].as_str().unwrap())
             .collect();
+        assert_eq!(types, vec!["web_search_call", "message", "function_call"]);
         assert_eq!(
-            types,
-            vec!["reasoning", "web_search_call", "message", "function_call"]
+            view.output[0]["action"]["query"], "rust news",
+            "visible web-search activity remains first"
         );
-        assert_eq!(
-            view.output[0]["summary"][0]["text"], "let me think",
-            "reasoning summary carries the thinking text"
+        assert!(
+            !view.output.iter().any(|item| item["type"] == "reasoning"),
+            "raw provider reasoning must not become a Responses summary"
         );
-        assert_eq!(view.output[1]["action"]["query"], "rust news");
     }
 
     // ---- 响应方向：SSE ----
@@ -1674,15 +1664,24 @@ mod tests {
     }
 
     #[test]
-    fn sse_reasoning_summary_events() {
+    fn sse_does_not_expose_raw_reasoning_as_a_summary() {
         let kinds = ToolKindMap::new();
-        let mut p = parsed_with_tool_calls(vec![]);
-        p.text = "hi".to_string();
-        p.thinking = "deep thought".to_string();
-        p.finish_reason = "stop".to_string();
+        let raw = "analysis code wasn't ours. Need wait. Use wait.";
+        let anthropic = json!({
+            "content": [
+                { "type": "thinking", "thinking": raw },
+                { "type": "text", "text": "hi" }
+            ],
+            "kiro_thinking": raw,
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        });
+        let p = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
         let sse = build_responses_sse(&p, &kinds);
-        assert!(sse.contains("event: response.reasoning_summary_text.delta"));
-        assert!(sse.contains("deep thought"));
-        assert!(sse.contains("\"reasoning\""));
+        assert!(!sse.contains("response.reasoning_summary_text"));
+        assert!(!sse.contains("analysis code wasn't ours"));
+        assert!(!sse.contains("Need wait"));
+        assert!(sse.contains("\"text\":\"hi\""));
+        assert!(sse.contains("event: response.completed"));
     }
 }

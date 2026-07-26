@@ -17,6 +17,7 @@ use crate::kiro::model::requests::tool::{
 };
 use crate::model::config::ToolCompatibilityMode;
 
+use super::model_registry;
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 use crate::image_resize::{ResizeConfig, maybe_shrink_image};
@@ -193,96 +194,31 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// 模型映射：将客户端模型名映射到 Kiro 模型 ID。
+///
+/// 实现委托给 [`model_registry::resolve`]：按「厂商 / 家族 / 代际」结构化解析，
+/// 而不是逐个版本号字符串比对。因此 Anthropic / OpenAI 发布沿用现有命名规律的
+/// 新模型时，这里**无需改码**即可路由；上游 `ListAvailableModels` 广告的新 ID
+/// 也会被自动学习。详见 `model_registry` 模块文档。
 pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("fable") {
-        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
-        Some("claude-fable-5".to_string())
-    } else if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-sonnet-4.8".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("sonnet.5")
-        {
-            // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
-            Some("claude-sonnet-5".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else if model_lower.starts_with("gpt-5") {
-        // GPT-5.x models served by the Kiro backend (e.g. gpt-5.6-sol / terra / luna).
-        // Kiro advertises and accepts these ids verbatim, so pass them through unchanged.
-        // Scoped to gpt-5* so legacy ids like "gpt-4" stay unsupported.
-        Some(model_lower)
-    } else {
-        None
-    }
+    model_registry::resolve(model)
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 优先取目录里的真实值（含上游 `ListAvailableModels` 的 `maxInputTokens`），
+/// 未收录的新模型按代际推断：Anthropic ≥ 4.6 为 1M，GPT-5.x 为 272K，其余 200K。
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        // GPT-5.6 family on Kiro ships a 272K context window.
-        Some(mapped) if mapped.starts_with("gpt") => 272_000,
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-fable-5" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
-    }
+    model_registry::context_window(model)
 }
 
-/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
+/// 是否为接受 `additionalModelRequestFields.output_config` 的模型。
 ///
-/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6、GPT 5.6 接受
-/// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
-/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
-/// 若后续实测某模型 400，从这里去除即可。
+/// 判定下沉到 [`model_registry::supports_native_reasoning`]：代际 ≥ 4.6 即视为
+/// 支持，haiku 与 GPT 系排除，已实测 400 的例外走注册表的 deny-list。
+/// 新模型默认落在「支持」一侧，不必逐个登记。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
-    let m = model_id.to_ascii_lowercase();
-    matches!(
-        m.as_str(),
-        "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-4.6"
-    ) || m.contains("fable-5")
-        || m.contains("mythos-5")
-        || m.contains("sonnet-5")
-        || m.contains("opus-5")
-        || m.contains("claude-5")
-        || m.starts_with("gpt-5.6-")
+    model_registry::supports_native_reasoning(model_id)
 }
 
 /// 本次请求是否请求了原生 reasoning。
@@ -291,7 +227,7 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
 /// （普通 enabled / 纯 effort 会 400），故单独判定；其余支持模型放宽为
 /// 「thinking 启用（enabled/adaptive） **或** 显式 `output_config.effort`」即算请求。
 fn native_reasoning_requested(req: &MessagesRequest, model_id: &str) -> bool {
-    if model_id == "claude-opus-4.6" {
+    if model_registry::requires_adaptive_thinking(model_id) {
         return req
             .thinking
             .as_ref()
@@ -408,29 +344,12 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     Some(normalized.as_str().to_string())
 }
 
+/// 是否接受 `effort = "xhigh"`。
+///
+/// 判定下沉到 [`model_registry::supports_xhigh_effort`]：代际 ≥ 4.7 允许，
+/// 4.5 / 4.6 系与 haiku 降级到 `high`，无法解析的未知 ID 保持宽松放行。
 fn model_supports_xhigh_effort(model_id: &str) -> bool {
-    let model = model_id.to_ascii_lowercase();
-
-    // Anthropic documents xhigh for Opus 4.7/4.8, Fable 5, and Mythos 5.
-    if model.contains("opus-4.7")
-        || model.contains("opus-4.8")
-        || model.contains("fable-5")
-        || model.contains("mythos-5")
-        || model.contains("claude-5")
-    {
-        return true;
-    }
-
-    // Known Kiro/Claude model ids that predate xhigh. Keep this as a compact
-    // deny-list, not a full capability matrix.
-    !matches!(
-        model.as_str(),
-        "claude-opus-4.6"
-            | "claude-sonnet-4.6"
-            | "claude-opus-4.5"
-            | "claude-sonnet-4.5"
-            | "claude-haiku-4.5"
-    )
+    model_registry::supports_xhigh_effort(model_id)
 }
 
 fn build_additional_model_request_fields(
@@ -1055,14 +974,46 @@ fn is_claude_code_mode(mode: ToolCompatibilityMode) -> bool {
     mode == ToolCompatibilityMode::ClaudeCode
 }
 
+const DROID_EDIT_CLIENT_NAME_SUFFIX: &str = "\u{1}droid_edit";
+
+/// Droid advertises `oldStr` / `newStr` but its executor requires
+/// `old_str` / `new_str`. Claude Code instead uses `old_string` /
+/// `new_string`, so retain the caller dialect with the tool-name mapping.
+fn uses_droid_edit_schema(tool: &super::types::Tool) -> bool {
+    tool.name == "Edit"
+        && tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|properties| {
+                properties.contains_key("oldStr")
+                    || properties.contains_key("newStr")
+                    || properties.contains_key("old_str")
+                    || properties.contains_key("new_str")
+            })
+}
+
+fn droid_edit_client_name(name: &str) -> String {
+    format!("{name}{DROID_EDIT_CLIENT_NAME_SUFFIX}")
+}
+
+fn restore_client_tool_name(name: &str) -> (&str, bool) {
+    match name.strip_suffix(DROID_EDIT_CLIENT_NAME_SUFFIX) {
+        Some(client_name) => (client_name, true),
+        None => (name, false),
+    }
+}
+
 /// 出站工具名映射：ClaudeCode 模式命中内置则改名并记录 `kiro名 → 客户端名`；
 /// 否则回退到长名缩短逻辑（map_tool_name）。
 fn map_client_tool_name_to_kiro(
     name: &str,
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
+    map_builtin: bool,
 ) -> String {
-    if is_claude_code_mode(mode)
+    if map_builtin
+        && is_claude_code_mode(mode)
         && let Some(kiro_name) = claude_code_tool_name_to_kiro(name)
     {
         tool_name_map
@@ -1105,8 +1056,9 @@ fn map_tool_input_to_kiro(
     client_name: &str,
     input: serde_json::Value,
     mode: ToolCompatibilityMode,
+    map_builtin: bool,
 ) -> Result<serde_json::Value, ConversionError> {
-    if !is_claude_code_mode(mode) {
+    if !map_builtin || !is_claude_code_mode(mode) {
         return Ok(input);
     }
     let Some(kiro_name) = claude_code_tool_name_to_kiro(client_name) else {
@@ -1124,8 +1076,16 @@ fn map_tool_input_to_kiro(
         }
         ("Edit", "str_replace") => {
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
-            maybe_insert(&mut out, "oldStr", take_first(&obj, &["old_string", "oldStr"]));
-            maybe_insert(&mut out, "newStr", take_first(&obj, &["new_string", "newStr"]));
+            maybe_insert(
+                &mut out,
+                "oldStr",
+                take_first(&obj, &["old_string", "old_str", "oldStr"]),
+            );
+            maybe_insert(
+                &mut out,
+                "newStr",
+                take_first(&obj, &["new_string", "new_str", "newStr"]),
+            );
         }
         ("Bash", "execute_bash") => {
             maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
@@ -1209,7 +1169,11 @@ fn map_tool_input_to_kiro(
 ///
 /// 这是相对参考实现的一处修正：参考以“客户端名”匹配，导致 Raw 模式下客户端自带的、
 /// 恰好叫 `Read` 的工具入参也会被误改写。以 Kiro 名匹配避免了该误伤，且入站无需穿透 mode。
-fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_json::Value {
+fn map_tool_input_from_kiro(
+    kiro_name: &str,
+    input: serde_json::Value,
+    droid_edit: bool,
+) -> serde_json::Value {
     let serde_json::Value::Object(obj) = input else {
         return input;
     };
@@ -1221,16 +1185,13 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
         }
         "str_replace" => {
             maybe_insert(&mut out, "file_path", take_first(&obj, &["path", "file_path"]));
-            maybe_insert(
-                &mut out,
-                "old_string",
-                take_first(&obj, &["oldStr", "old_string"]),
-            );
-            maybe_insert(
-                &mut out,
-                "new_string",
-                take_first(&obj, &["newStr", "new_string"]),
-            );
+            let (old_key, new_key) = if droid_edit {
+                ("old_str", "new_str")
+            } else {
+                ("old_string", "new_string")
+            };
+            maybe_insert(&mut out, old_key, take_first(&obj, &["oldStr", "old_string"]));
+            maybe_insert(&mut out, new_key, take_first(&obj, &["newStr", "new_string"]));
         }
         "execute_bash" => {
             maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
@@ -1280,12 +1241,13 @@ pub fn restore_tool_use_for_client(
     input: serde_json::Value,
     tool_name_map: &HashMap<String, String>,
 ) -> (String, serde_json::Value) {
-    let client_name = tool_name_map
+    let configured_name = tool_name_map
         .get(kiro_name)
         .cloned()
         .unwrap_or_else(|| kiro_name.to_string());
-    let client_input = map_tool_input_from_kiro(kiro_name, input);
-    (client_name, client_input)
+    let (client_name, droid_edit) = restore_client_tool_name(&configured_name);
+    let client_input = map_tool_input_from_kiro(kiro_name, input, droid_edit);
+    (client_name.to_string(), client_input)
 }
 
 fn optional_schema(schema: serde_json::Value) -> serde_json::Value {
@@ -1423,15 +1385,21 @@ fn convert_tools(
             continue;
         }
 
-        let mapped_name = map_client_tool_name_to_kiro(&t.name, tool_name_map, mode);
+        let droid_edit = uses_droid_edit_schema(t);
+        let map_builtin =
+            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some();
+        let mapped_name =
+            map_client_tool_name_to_kiro(&t.name, tool_name_map, mode, map_builtin);
+        if droid_edit && mapped_name == "str_replace" {
+            tool_name_map.insert(mapped_name.clone(), droid_edit_client_name(&t.name));
+        }
         // 按小写名去重（Kiro 工具名大小写不敏感），首个出现者胜出。
         if !seen.insert(mapped_name.to_lowercase()) {
             tracing::debug!("跳过重复的映射工具名: {}", mapped_name);
             continue;
         }
 
-        let is_builtin =
-            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some();
+        let is_builtin = map_builtin;
 
         let description = if is_builtin {
             kiro_builtin_tool_description(&mapped_name, &t.description)
@@ -1689,9 +1657,23 @@ fn convert_assistant_message(
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                let mapped_name =
-                                    map_client_tool_name_to_kiro(&name, tool_name_map, mode);
-                                let input = map_tool_input_to_kiro(&name, input, mode)?;
+                                // A Droid Edit tool is mapped to native `str_replace`, but
+                                // its tagged name mapping keeps follow-up history in the
+                                // executor's `old_str`/`new_str` dialect.
+                                let map_builtin = name != "Edit"
+                                    || tool_name_map
+                                        .get("str_replace")
+                                        .is_some_and(|client_name| {
+                                            restore_client_tool_name(client_name).0 == name
+                                        });
+                                let mapped_name = map_client_tool_name_to_kiro(
+                                    &name,
+                                    tool_name_map,
+                                    mode,
+                                    map_builtin,
+                                );
+                                let input =
+                                    map_tool_input_to_kiro(&name, input, mode, map_builtin)?;
                                 tool_uses
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
@@ -1824,6 +1806,19 @@ mod tests {
             Some("claude-opus-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
     }
 
     #[test]
@@ -2167,6 +2162,9 @@ mod tests {
             "claude-sonnet-4.5",
             "claude-opus-4.5",
             "claude-haiku-4.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
         ] {
             assert!(
                 !model_supports_native_reasoning(m),
@@ -2241,14 +2239,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_effort_emits_for_gpt_5_6_family() {
+    fn gpt_5_6_family_never_emits_output_config() {
+        // GPT-5.6 (sol/terra/luna) reasons natively and the Kiro upstream rejects
+        // additionalModelRequestFields.output_config for it (REQUEST_BODY_INVALID),
+        // so the converter must never forward it even when the client sends effort.
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let req = minimal_request_with_effort(model, "high");
             let result = convert_request(&req).unwrap();
-            let fields = result.additional_model_request_fields.unwrap_or_else(|| {
-                panic!("{model} should forward explicit reasoning effort")
-            });
-            assert_eq!(fields.output_config.unwrap().effort, "high");
+            assert!(
+                result.additional_model_request_fields.is_none(),
+                "{model} must not forward output_config; upstream rejects it"
+            );
         }
     }
 
@@ -2487,11 +2488,60 @@ mod tests {
     }
 
     #[test]
+    fn droid_edit_tool_uses_executor_argument_names() {
+        let mut edit = cc_tool("Edit");
+        edit.input_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({
+                "file_path": {"type": "string"},
+                "oldStr": {"type": "string"},
+                "newStr": {"type": "string"}
+            }),
+        );
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![edit]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+
+        assert_eq!(out[0].tool_specification.name, "str_replace");
+
+        let input = serde_json::json!({
+            "file_path": "C:\\\\project\\\\app.js",
+            "old_str": "before",
+            "new_str": "after"
+        });
+        let history_input = map_tool_input_to_kiro(
+            "Edit",
+            input.clone(),
+            ToolCompatibilityMode::ClaudeCode,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            history_input,
+            serde_json::json!({
+                "path": "C:\\\\project\\\\app.js",
+                "oldStr": "before",
+                "newStr": "after"
+            })
+        );
+
+        let (name, restored) =
+            restore_tool_use_for_client("str_replace", history_input, &map);
+        assert_eq!(name, "Edit");
+        assert_eq!(restored, input, "Droid must receive old_str/new_str");
+    }
+
+    #[test]
     fn cc_outbound_input_write_and_read() {
         let out = map_tool_input_to_kiro(
             "Write",
             serde_json::json!({"file_path": "/a.txt", "content": "hi"}),
             ToolCompatibilityMode::ClaudeCode,
+            true,
         )
         .unwrap();
         assert_eq!(out, serde_json::json!({"path": "/a.txt", "text": "hi"}));
@@ -2500,6 +2550,7 @@ mod tests {
             "Read",
             serde_json::json!({"file_path": "/a", "offset": 10, "limit": 5}),
             ToolCompatibilityMode::ClaudeCode,
+            true,
         )
         .unwrap();
         assert_eq!(read["path"], serde_json::json!("/a"));
@@ -2514,6 +2565,7 @@ mod tests {
             "Read",
             serde_json::json!({"file_path": "/a", "pages": "1-3"}),
             ToolCompatibilityMode::ClaudeCode,
+            true,
         )
         .unwrap_err();
         assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
@@ -2522,7 +2574,9 @@ mod tests {
     #[test]
     fn cc_raw_mode_input_passthrough() {
         let input = serde_json::json!({"file_path": "/a.txt", "content": "hi"});
-        let out = map_tool_input_to_kiro("Write", input.clone(), ToolCompatibilityMode::Raw).unwrap();
+        let out =
+            map_tool_input_to_kiro("Write", input.clone(), ToolCompatibilityMode::Raw, false)
+                .unwrap();
         assert_eq!(out, input, "Raw 模式入参原样透传");
     }
 
@@ -2530,7 +2584,7 @@ mod tests {
     fn cc_roundtrip_write_out_then_in() {
         let client = serde_json::json!({"file_path": "/a.txt", "content": "hello"});
         let kiro =
-            map_tool_input_to_kiro("Write", client.clone(), ToolCompatibilityMode::ClaudeCode)
+            map_tool_input_to_kiro("Write", client.clone(), ToolCompatibilityMode::ClaudeCode, true)
                 .unwrap();
         assert_eq!(kiro, serde_json::json!({"path": "/a.txt", "text": "hello"}));
         let mut map = HashMap::new();

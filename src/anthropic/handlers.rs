@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
+use super::model_registry;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -393,216 +394,26 @@ fn resolve_usage_input_tokens(
     context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
 }
 
+/// `/v1/models` 目录（委托给模型注册表）。
+///
+/// 改造前这里是手写的静态数组：Anthropic / OpenAI 每发一个新模型都要加两条
+/// （普通 + `-thinking`）并重新编译，漏加则客户端探测不到。现在条目由
+/// [`model_registry::advertised_models`] 生成 —— 内置 seed、上游
+/// `ListAvailableModels` 学到的新 ID、以及配置 override 三者合并，
+/// 新模型无需改码即可被广告出去。
 fn available_models() -> Vec<Model> {
-    vec![
-        Model {
-            id: "gpt-5.6-sol".to_string(),
+    model_registry::advertised_models()
+        .into_iter()
+        .map(|m| Model {
+            id: m.id,
             object: "model".to_string(),
-            created: 1782000000,
-            owned_by: "openai".to_string(),
-            display_name: "GPT-5.6 Sol".to_string(),
+            created: m.created,
+            owned_by: m.owned_by.to_string(),
+            display_name: m.display_name,
             model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "gpt-5.6-terra".to_string(),
-            object: "model".to_string(),
-            created: 1782000000,
-            owned_by: "openai".to_string(),
-            display_name: "GPT-5.6 Terra".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "gpt-5.6-luna".to_string(),
-            object: "model".to_string(),
-            created: 1782000000,
-            owned_by: "openai".to_string(),
-            display_name: "GPT-5.6 Luna".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-fable-5".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-fable-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-5".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ]
+            max_tokens: m.max_tokens,
+        })
+        .collect()
 }
 
 /// GET /v1/models
@@ -1368,10 +1179,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    // 哪些模型只接受 adaptive（当前仅 Opus 4.6）由注册表统一裁决，
+    // 避免这里再维护一份版本号判断。
+    let thinking_type = model_registry::thinking_type_for(&payload.model);
 
     tracing::info!(
         model = %payload.model,
@@ -1384,7 +1194,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    // adaptive-only 模型（Opus 4.6）必须同时带上 output_config，否则上游 400。
+    if thinking_type == "adaptive" {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -2013,5 +1824,61 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-8-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-8"));
         assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+    }
+
+    /// `/v1/models` 从静态数组换成注册表驱动后，不得丢掉任何一个原先广告的 ID。
+    /// 这是老客户端（写死模型名的脚本 / cc-kiro 探测逻辑）的兼容护栏。
+    #[test]
+    fn available_models_still_covers_every_previously_static_id() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        // 改造前 available_models() 手写的全部 24 条。
+        const LEGACY_STATIC_IDS: &[&str] = &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "claude-fable-5",
+            "claude-fable-5-thinking",
+            "claude-sonnet-5",
+            "claude-sonnet-5-thinking",
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "claude-opus-4-8",
+            "claude-opus-4-8-thinking",
+            "claude-sonnet-4-8",
+            "claude-sonnet-4-8-thinking",
+            "claude-opus-4-7",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-6",
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-thinking",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-5-20251101-thinking",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5-20250929-thinking",
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5-20251001-thinking",
+        ];
+
+        for legacy in LEGACY_STATIC_IDS {
+            assert!(
+                ids.contains(legacy),
+                "{legacy} 曾被静态目录广告，注册表目录不得丢失"
+            );
+        }
+    }
+
+    /// 广告出来的每个 ID 都必须真的能路由（否则客户端选了就 400）。
+    #[test]
+    fn every_advertised_model_is_routable() {
+        for model in available_models() {
+            assert!(
+                super::super::converter::map_model(&model.id).is_some(),
+                "{} 被广告但无法路由",
+                model.id
+            );
+        }
     }
 }

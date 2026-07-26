@@ -179,9 +179,26 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 模型注册表 override（可选）。
+    ///
+    /// 正常情况下不需要配置：新模型由模型注册表按「厂商 / 家族 / 代际」自动识别，
+    /// 上游 `ListAvailableModels` 广告的新 ID 也会被自动学习。
+    /// 只有当上游给某个模型换了**参数契约**（新 effort 档位、拒收
+    /// `additionalModelRequestFields`、非常规命名等）时，才用这里打补丁，
+    /// 免去等新版本二进制。
+    #[serde(default, skip_serializing_if = "is_default_model_registry")]
+    pub model_registry: crate::anthropic::model_registry::ModelRegistryOverrides,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// 空的 `model_registry` 不写回 config.json，保持配置文件干净。
+fn is_default_model_registry(
+    overrides: &crate::anthropic::model_registry::ModelRegistryOverrides,
+) -> bool {
+    *overrides == Default::default()
 }
 
 fn default_host() -> String {
@@ -292,6 +309,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
+            model_registry: Default::default(),
             config_path: None,
         }
     }

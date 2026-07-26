@@ -2712,6 +2712,42 @@ impl MultiTokenManager {
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
     }
 
+    /// 用任意一个健康凭据查询上游可用模型列表（模型注册表刷新用）。
+    ///
+    /// 与 [`Self::get_available_models_for`] 的区别：不指定凭据，按顺序试到
+    /// 第一个成功为止。用于「不关心是谁问的，只想知道上游现在提供哪些模型」。
+    pub async fn discover_available_models(&self) -> anyhow::Result<ListAvailableModelsResponse> {
+        let candidates: Vec<u64> = {
+            let entries = self.entries.lock();
+            let now = Instant::now();
+            entries
+                .iter()
+                .filter(|e| !e.disabled && !e.throttled_until.is_some_and(|t| t > now))
+                .map(|e| e.id)
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            anyhow::bail!("没有可用凭据用于查询可用模型");
+        }
+
+        let mut last_err = None;
+        for id in candidates {
+            match self.get_available_models_for(id).await {
+                Ok(resp) if !resp.models.is_empty() => return Ok(resp),
+                Ok(_) => {
+                    tracing::debug!(credential_id = id, "ListAvailableModels 返回空列表，换下一个凭据");
+                }
+                Err(e) => {
+                    tracing::debug!(credential_id = id, error = %e, "ListAvailableModels 查询失败，换下一个凭据");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("所有凭据均未返回可用模型")))
+    }
+
     /// 设置用户偏好（开启/关闭超额）— Admin API
     ///
     /// 与 `get_usage_limits_for` 类似的 token 准备流程，最后调用上游
