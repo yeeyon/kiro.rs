@@ -56,7 +56,7 @@ impl Frame {
 
     /// 将 payload 解析为字符串
     pub fn payload_as_str(&self) -> String {
-        String::from_utf8_lossy(&self.payload).to_string()
+        String::from_utf8_lossy(&self.payload).into_owned()
     }
 }
 
