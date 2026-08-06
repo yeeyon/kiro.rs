@@ -1055,11 +1055,14 @@ impl SseEvent {
 
     /// 格式化为 SSE 字符串
     pub fn to_sse_string(&self) -> String {
-        format!(
-            "event: {}\ndata: {}\n\n",
-            self.event,
-            serde_json::to_string(&self.data).unwrap_or_default()
-        )
+        let json = serde_json::to_string(&self.data).unwrap_or_default();
+        let mut s = String::with_capacity(self.event.len() + json.len() + 16);
+        s.push_str("event: ");
+        s.push_str(&self.event);
+        s.push_str("\ndata: ");
+        s.push_str(&json);
+        s.push_str("\n\n");
+        s
     }
 }
 
@@ -1756,8 +1759,7 @@ impl StreamContext {
             } else {
                 // thinking 已提取完成，剩余内容作为 text_delta
                 if !self.thinking_buffer.is_empty() {
-                    let remaining = self.thinking_buffer.clone();
-                    self.thinking_buffer.clear();
+                    let remaining = std::mem::take(&mut self.thinking_buffer);
                     events.extend(self.create_text_delta_events(&remaining));
                 }
                 break;
@@ -2439,7 +2441,7 @@ impl StreamContext {
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta
-                let buffer_content = self.thinking_buffer.clone();
+                let buffer_content = std::mem::take(&mut self.thinking_buffer);
                 events.extend(self.create_text_delta_events(&buffer_content));
             }
             self.thinking_buffer.clear();
@@ -2627,12 +2629,11 @@ impl BufferedStreamContext {
 ///
 /// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
     let mut chinese_count = 0;
     let mut other_count = 0;
 
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
+    for c in text.chars() {
+        if c >= '\u{4E00}' && c <= '\u{9FFF}' {
             chinese_count += 1;
         } else {
             other_count += 1;

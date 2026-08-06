@@ -907,7 +907,15 @@ fn create_sse_stream(
             }
 
             // 使用 select! 同时等待数据和 ping 定时器
+            // biased 模式：优先检查 ping 定时器，避免在上游 chunk 密集时 ping 被"饿死"
             tokio::select! {
+                biased;
+                // 发送 ping 保活
+                _ = ping_interval.tick() => {
+                    tracing::trace!("发送 ping 保活事件");
+                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                }
                 // 处理数据流
                 chunk_result = body_stream.next() => {
                     match chunk_result {
@@ -919,13 +927,15 @@ fn create_sse_stream(
                                 tracing::warn!("缓冲区溢出: {}", e);
                             }
 
-                            let mut events = Vec::new();
+                            // 解码事件并直接转换为 SSE 字节流（避免中间 Vec<SseEvent> 分配）
+                            let mut bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                            for sse_event in ctx.process_kiro_event(&event) {
+                                                bytes.push(Ok(Bytes::from(sse_event.to_sse_string())));
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -933,12 +943,6 @@ fn create_sse_stream(
                                     }
                                 }
                             }
-
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
 
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
@@ -993,12 +997,6 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                     }
-                }
-                // 发送 ping 保活
-                _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
                 }
             }
         },
