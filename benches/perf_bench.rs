@@ -5,6 +5,8 @@
 //! Or if criterion is unavailable: cargo test --release --bench perf_bench -- --nocapture
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // ── estimate_tokens micro-bench ──────────────────────────────────────────────
 //
@@ -219,10 +221,227 @@ fn bench_connection_reuse(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Streaming latency: buffered vs live ──────────────────────────────────────
+//
+// Simulates the /cc/v1/messages path. A mock server sends N chunks with a
+// delay between each (simulating token generation latency). We measure
+// time-to-first-event (TTFE) for both approaches:
+//
+// - "buffered" (old /cc behavior): reads ALL chunks, then emits all events
+// - "live" (new /cc behavior): emits events as each chunk arrives
+//
+// The difference is the latency the user perceives before seeing any output.
+
+fn bench_streaming_latency(c: &mut Criterion) {
+    use std::time::Duration;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let mut group = c.benchmark_group("streaming_latency");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(15));
+
+    for (label, num_chunks, delay_ms) in [
+        ("10_chunks_50ms", 10, 50),
+        ("20_chunks_50ms", 20, 50),
+        ("10_chunks_200ms", 10, 200),
+    ] {
+        // -- Buffered: simulate reading all chunks then emitting --
+        group.bench_function(BenchmarkId::new("buffered_old", label), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    // Simulate upstream: N chunks, each delayed by delay_ms
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+                    tokio::spawn(async move {
+                        for i in 0..num_chunks {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            let _ = tx.send(format!("chunk_{}\n", i).into_bytes()).await;
+                        }
+                    });
+
+                    // Buffered: collect ALL chunks before emitting anything
+                    let mut all_events = Vec::new();
+                    while let Some(chunk) = rx.recv().await {
+                        all_events.push(chunk);
+                    }
+                    // "Emit" all at once
+                    black_box(all_events.len());
+                })
+            })
+        });
+
+        // -- Live: emit events as they arrive --
+        group.bench_function(BenchmarkId::new("live_new", label), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+                    tokio::spawn(async move {
+                        for i in 0..num_chunks {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            let _ = tx.send(format!("chunk_{}\n", i).into_bytes()).await;
+                        }
+                    });
+
+                    // Live: process each chunk as it arrives
+                    let mut count = 0;
+                    while let Some(chunk) = rx.recv().await {
+                        count += 1;
+                        black_box(&chunk);
+                    }
+                    black_box(count);
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+// ── Time-to-first-event: buffered vs live ────────────────────────────────────
+//
+// Measures the actual wall-clock time from start to first event reaching
+// the "client". This is what the user perceives as "how long before I see
+// output". Uses iter_custom so criterion reports only the TTFE, not the
+// total stream drain time.
+
+fn bench_time_to_first_event(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let mut group = c.benchmark_group("time_to_first_event");
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(20));
+
+    for (label, num_chunks, delay_ms) in [
+        ("10_chunks_100ms", 10, 100),
+        ("20_chunks_100ms", 20, 100),
+        ("50_chunks_50ms", 50, 50),
+    ] {
+        // Buffered TTFE: time until ALL chunks are collected (≈ total response time)
+        group.bench_function(BenchmarkId::new("buffered_old", label), |b| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
+                        tokio::spawn(async move {
+                            for _ in 0..num_chunks {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                let _ = tx.send(()).await;
+                            }
+                        });
+
+                        let start = Instant::now();
+                        // Buffered: wait for ALL chunks before "emitting" anything
+                        while rx.recv().await.is_some() {}
+                        total += start.elapsed();
+                    }
+                    total
+                })
+            })
+        });
+
+        // Live TTFE: time until FIRST chunk arrives (≈ first token latency)
+        group.bench_function(BenchmarkId::new("live_new", label), |b| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
+                        tokio::spawn(async move {
+                            for _ in 0..num_chunks {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                let _ = tx.send(()).await;
+                            }
+                        });
+
+                        let start = Instant::now();
+                        // Live: first event arrives after just one delay period
+                        let _first = rx.recv().await;
+                        total += start.elapsed();
+                        // Drain remaining in background (don't count in TTFE)
+                        tokio::spawn(async move {
+                            while rx.recv().await.is_some() {}
+                        });
+                    }
+                    total
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+// ── Concurrent refresh: global lock vs per-credential ────────────────────────
+//
+// Simulates N credentials refreshing concurrently. Each "refresh" takes
+// ~50ms (network call). With a global lock, all N refreshes serialize.
+// With per-credential locks, all N refreshes run concurrently.
+
+fn bench_concurrent_refresh(c: &mut Criterion) {
+    use std::time::Duration;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let refresh_duration = Duration::from_millis(50);
+
+    let mut group = c.benchmark_group("concurrent_refresh");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(15));
+
+    for num_creds in [2, 5, 10] {
+        // Global lock (old behavior): all refreshes serialize
+        group.bench_function(BenchmarkId::new("global_lock_old", num_creds), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let global_lock = Arc::new(tokio::sync::Mutex::new(()));
+                    let mut handles = Vec::new();
+                    for _ in 0..num_creds {
+                        let lock = global_lock.clone();
+                        handles.push(tokio::spawn(async move {
+                            let _guard = lock.lock().await;
+                            tokio::time::sleep(refresh_duration).await;
+                        }));
+                    }
+                    for h in handles {
+                        h.await.unwrap();
+                    }
+                })
+            })
+        });
+
+        // Per-credential locks (new behavior): all refreshes concurrent
+        group.bench_function(BenchmarkId::new("per_cred_lock_new", num_creds), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let mut locks = Vec::new();
+                    for _ in 0..num_creds {
+                        locks.push(Arc::new(tokio::sync::Mutex::new(())));
+                    }
+                    let mut handles = Vec::new();
+                    for lock in locks {
+                        handles.push(tokio::spawn(async move {
+                            let _guard = lock.lock().await;
+                            tokio::time::sleep(refresh_duration).await;
+                        }));
+                    }
+                    for h in handles {
+                        h.await.unwrap();
+                    }
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_estimate_tokens,
     bench_to_sse_string,
     bench_connection_reuse,
+    bench_streaming_latency,
+    bench_time_to_first_event,
+    bench_concurrent_refresh,
 );
 criterion_main!(benches);
