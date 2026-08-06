@@ -1605,7 +1605,9 @@ pub async fn post_messages_cc(
         .unwrap_or_default();
 
     if payload.stream {
-        // 流式响应（缓冲模式）
+        // 流式响应（实时模式）
+        // 使用与 /v1/messages 相同的实时流式路径，不再缓冲整个响应。
+        // message_start 携带估算的 input_tokens，最终 message_delta 携带修正后的准确用量。
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
@@ -1614,15 +1616,15 @@ pub async fn post_messages_cc(
                 is_stream: true,
             },
         ));
-        handle_stream_request_buffered(
+        handle_stream_request(
             provider,
             &request_body,
             &payload.model,
+            total_input_tokens,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
             hook,
-            total_input_tokens,
             cache_usage,
             tracer,
             key_ctx.group.clone(),
