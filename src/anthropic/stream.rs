@@ -1043,6 +1043,9 @@ impl ToolJsonAccumulator {
 pub struct SseEvent {
     pub event: String,
     pub data: serde_json::Value,
+    /// 预序列化的 JSON 字符串。设置时 to_sse_string 直接使用它，
+    /// 跳过 serde_json::to_string(&data) 的序列化开销。
+    raw_json: Option<String>,
 }
 
 impl SseEvent {
@@ -1050,12 +1053,26 @@ impl SseEvent {
         Self {
             event: event.into(),
             data,
+            raw_json: None,
+        }
+    }
+
+    /// 从预序列化的 JSON 字符串创建，跳过 Value 树分配。
+    pub fn new_raw(event: impl Into<String>, raw_json: String) -> Self {
+        Self {
+            event: event.into(),
+            data: serde_json::Value::Null,
+            raw_json: Some(raw_json),
         }
     }
 
     /// 格式化为 SSE 字符串
     pub fn to_sse_string(&self) -> String {
-        let json = serde_json::to_string(&self.data).unwrap_or_default();
+        let json: std::borrow::Cow<str> = if let Some(ref raw) = self.raw_json {
+            std::borrow::Cow::Borrowed(raw.as_str())
+        } else {
+            std::borrow::Cow::Owned(serde_json::to_string(&self.data).unwrap_or_default())
+        };
         let mut s = String::with_capacity(self.event.len() + json.len() + 16);
         s.push_str("event: ");
         s.push_str(&self.event);
