@@ -1370,7 +1370,7 @@ pub async fn post_messages_cc(
         .unwrap_or_default();
 
     if payload.stream {
-        // 流式响应（缓冲模式）
+        // 流式响应（实时模式，与 /v1/messages 相同的流式路径）
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
@@ -1379,15 +1379,15 @@ pub async fn post_messages_cc(
                 is_stream: true,
             },
         ));
-        handle_stream_request_buffered(
+        handle_stream_request(
             provider,
             &request_body,
             &payload.model,
+            total_input_tokens,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
             hook,
-            total_input_tokens,
             cache_usage,
             tracer,
             key_ctx.group.clone(),

@@ -301,10 +301,13 @@ impl<'a> Iterator for DecodeIter<'a> {
     type Item = ParseResult<Frame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 如果处于 Stopped 或 Recovering 状态，停止迭代
+        // Stopped：永久停止。Recovering：重置为 Ready 并继续解码剩余帧，
+        // 避免单个 chunk 内解析错误后丢弃后续有效帧。
         match self.decoder.state {
             DecoderState::Stopped => return None,
-            DecoderState::Recovering => return None,
+            DecoderState::Recovering => {
+                self.decoder.state = DecoderState::Ready;
+            }
             _ => {}
         }
 

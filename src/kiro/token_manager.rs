@@ -13,6 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -1005,8 +1006,8 @@ pub struct MultiTokenManager {
     /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
     /// 从而继承旧账号按 credential_id 聚合的 trace/usage 历史。
     next_id: AtomicU64,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// Token 刷新锁（按凭据隔离），确保同一凭据同一时间只有一个刷新操作。
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 凭据文件写入锁。`persist_credentials` 用整文件覆写，并发调用会互相踩踏，
@@ -1182,7 +1183,7 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             next_id: AtomicU64::new(next_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
             credentials_path,
             persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
@@ -1265,6 +1266,15 @@ impl MultiTokenManager {
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：均衡选择可用凭据
     ///
+    /// 获取指定凭据的 token 刷新锁（按凭据隔离，不同凭据可并发刷新）
+    fn token_refresh_lock(&self, id: u64) -> Arc<TokioMutex<()>> {
+        self.refresh_locks
+            .lock()
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
@@ -1506,7 +1516,8 @@ impl MultiTokenManager {
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            let _refresh_lock = self.token_refresh_lock(id);
+            let _guard = _refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -2497,7 +2508,8 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let _refresh_lock = self.token_refresh_lock(id);
+            let _guard = _refresh_lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -2640,7 +2652,8 @@ impl MultiTokenManager {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
         } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
-            let _guard = self.refresh_lock.lock().await;
+            let _refresh_lock = self.token_refresh_lock(id);
+            let _guard = _refresh_lock.lock().await;
             let current_creds = {
                 let entries = self.entries.lock();
                 entries
@@ -2777,7 +2790,8 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let _refresh_lock = self.token_refresh_lock(id);
+            let _guard = _refresh_lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -3286,7 +3300,8 @@ impl MultiTokenManager {
         };
 
         // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        let _refresh_lock = self.token_refresh_lock(id);
+        let _guard = _refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
         let global_proxy = self.proxy.lock().clone();
