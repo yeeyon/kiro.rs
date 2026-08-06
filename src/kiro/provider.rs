@@ -160,11 +160,21 @@ impl KiroProvider {
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
-        let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
-            return Ok(client);
+        // Fast path: check cache under a short-lived lock
+        {
+            let cache = self.client_cache.lock();
+            if let Some(client) = cache.get(&effective) {
+                return Ok(client);
+            }
         }
+        // Slow path: build the client WITHOUT holding the lock so concurrent
+        // cache hits on other threads are not blocked by TLS connector init.
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let mut cache = self.client_cache.lock();
+        // Another thread may have inserted the same key in the meantime.
+        if let Some(existing) = cache.get(&effective) {
+            return Ok(existing);
+        }
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -327,12 +337,11 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = self.client_for(&ctx.credentials)?;
+            let base = client
                 .post(&url)
                 .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {
@@ -546,12 +555,11 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = self.client_for(&ctx.credentials)?;
+            let base = client
                 .post(&url)
                 .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_api(base, &rctx);
 
             // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
@@ -561,7 +569,7 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            let response = match client.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(

@@ -188,7 +188,6 @@ async fn refresh_social_token(
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -291,7 +290,6 @@ async fn refresh_idc_token(
         .header("host", format!("oidc.{}.amazonaws.com", region))
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=4")
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -524,8 +522,7 @@ pub(crate) async fn get_usage_limits(
             .header("host", &host)
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close");
+            .header("Authorization", format!("Bearer {}", token));
 
         if let Some(token_type) = credentials.token_type_header() {
             request = request.header("tokentype", token_type);
@@ -617,8 +614,7 @@ pub(crate) async fn get_available_models(
             .header("host", &host)
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close");
+            .header("Authorization", format!("Bearer {}", token));
 
         if let Some(token_type) = credentials.token_type_header() {
             request = request.header("tokentype", token_type);
@@ -721,7 +717,6 @@ pub(crate) async fn list_available_profiles(
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=1")
             .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close")
             .body(r#"{"maxResults":10}"#);
 
         if let Some(token_type) = credentials.token_type_header() {
@@ -819,7 +814,6 @@ pub(crate) async fn set_user_preference(
             .header("amz-sdk-request", "attempt=1; max=1")
             .header("Authorization", format!("Bearer {}", token))
             .header("content-type", "application/json")
-            .header("Connection", "close")
             .json(&body);
 
         if let Some(token_type) = credentials.token_type_header() {
