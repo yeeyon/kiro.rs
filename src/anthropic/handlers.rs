@@ -525,8 +525,6 @@ fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model>
     aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
 }
 
-}
-
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -2148,7 +2146,7 @@ mod tests {
     /// 这是老客户端（写死模型名的脚本 / cc-kiro 探测逻辑）的兼容护栏。
     #[test]
     fn available_models_still_covers_every_previously_static_id() {
-        let models = available_models();
+        let models = crate::anthropic::model_registry::advertised_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
         // 改造前 available_models() 手写的全部 24 条。
@@ -2191,7 +2189,7 @@ mod tests {
     /// 广告出来的每个 ID 都必须真的能路由（否则客户端选了就 400）。
     #[test]
     fn every_advertised_model_is_routable() {
-        for model in available_models() {
+        for model in crate::anthropic::model_registry::advertised_models() {
             assert!(
                 super::super::converter::map_model(&model.id).is_some(),
                 "{} 被广告但无法路由",

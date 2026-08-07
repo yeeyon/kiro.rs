@@ -208,17 +208,6 @@ fn invalid_model_reason(model: &str) -> Option<&'static str> {
     }
 }
 
-/// 模型映射：将客户端模型名映射到 Kiro 模型 ID。
-///
-/// 实现委托给 [`model_registry::resolve`]：按「厂商 / 家族 / 代际」结构化解析，
-/// 而不是逐个版本号字符串比对。因此 Anthropic / OpenAI 发布沿用现有命名规律的
-/// 新模型时，这里**无需改码**即可路由；上游 `ListAvailableModels` 广告的新 ID
-/// 也会被自动学习。详见 `model_registry` 模块文档。
-pub fn map_model(model: &str) -> Option<String> {
-    model_registry::resolve(model)
-}
-}
-
 fn canonical_version(parts: &[&str]) -> Option<String> {
     let first = *parts.first()?;
     if parts.len() == 1
@@ -288,7 +277,7 @@ fn normalize_claude_model(model: &str) -> Option<String> {
     Some(format!("claude-{}-{}", parts[family_index], version))
 }
 
-/// 模型映射：自定义别名优先，已知 Claude 格式规范化，其余合法 ID 原样透传。
+/// 模型映射：自定义别名优先，Claude 格式规范化，model_registry 结构化路由，其余合法 ID 原样透传。
 pub fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
         return None;
@@ -299,7 +288,22 @@ pub fn map_model(model: &str) -> Option<String> {
         return Some(custom.backend_id.clone());
     }
 
-    normalize_claude_model(model).or_else(|| Some(model.to_string()))
+    // Claude 格式规范化（保留 v0.7.5 行为，包括 -beta 等后缀的 passthrough）。
+    if let Some(normalized) = normalize_claude_model(model) {
+        return Some(normalized);
+    }
+
+    // 非 Claude 模型：委托 model_registry 按厂商 / 家族 / 代际结构化路由。
+    // Claude 模型经 normalize_claude_model 未命中的（如 -beta 后缀）原样透传，
+    // 不走 model_registry 以避免过度规范化。
+    if !model.to_ascii_lowercase().starts_with("claude-") {
+        if let Some(resolved) = model_registry::resolve(model) {
+            return Some(resolved);
+        }
+    }
+
+    // 最终回退：原样透传
+    Some(model.to_string())
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
@@ -315,7 +319,6 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
     model_registry::context_window(model)
 }
-}
 
 /// 是否为接受 `additionalModelRequestFields.output_config` 的模型。
 ///
@@ -328,7 +331,6 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
         return true;
     }
     model_registry::supports_native_reasoning(model_id)
-}
 }
 
 /// 本次请求是否请求了原生 reasoning。

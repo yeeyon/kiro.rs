@@ -4178,7 +4178,8 @@ impl MultiTokenManager {
             // The refresh token is bound to its OIDC client registration. Serialize the
             // mutation with refreshes so an in-flight old refresh cannot overwrite this login.
             // Released before persisting so disk I/O does not stall every other refresh.
-            let _guard = self.refresh_lock.lock().await;
+            let _refresh_lock = self.token_refresh_lock(id);
+            let _guard = _refresh_lock.lock().await;
             let mut entries = self.entries.lock();
             let idx = entries
                 .iter()

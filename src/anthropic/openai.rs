@@ -660,7 +660,6 @@ mod tests {
             finish_reason: "stop".to_string(),
             prompt_tokens: 7,
             completion_tokens: 11,
-            thinking: String::new(),
             web_searches: Vec::new(),
             credit_usage: None,
             credit_unit: None,
