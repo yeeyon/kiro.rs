@@ -772,6 +772,7 @@ pub async fn post_messages(
             &payload.model,
             total_input_tokens,
             thinking_enabled,
+            true,
             tool_name_map,
             known_tool_names,
             hook,
@@ -797,6 +798,7 @@ pub async fn post_messages(
             &payload.model,
             total_input_tokens,
             extract_thinking,
+            true,
             tool_name_map,
             known_tool_names,
             hook,
@@ -815,6 +817,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    emit_redacted_thinking: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
@@ -852,6 +855,7 @@ async fn handle_stream_request(
         tool_name_map,
         known_tool_names,
     );
+    ctx.set_emit_redacted_thinking(emit_redacted_thinking);
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -1049,6 +1053,7 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    emit_redacted_thinking: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
     // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
@@ -1251,6 +1256,7 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content = build_non_stream_content(
         thinking_enabled,
+        emit_redacted_thinking,
         text_content,
         native_thinking,
         native_thinking_signature,
@@ -1323,6 +1329,7 @@ async fn handle_non_stream_request(
 
 fn build_non_stream_content(
     thinking_enabled: bool,
+    emit_redacted_thinking: bool,
     text_content: String,
     native_thinking: String,
     native_thinking_signature: Option<String>,
@@ -1360,11 +1367,13 @@ fn build_non_stream_content(
             }
         }
 
-        for redacted in native_redacted_thinking {
-            content.push(json!({
-                "type": "redacted_thinking",
-                "data": redacted
-            }));
+        if emit_redacted_thinking {
+            for redacted in native_redacted_thinking {
+                content.push(json!({
+                    "type": "redacted_thinking",
+                    "data": redacted
+                }));
+            }
         }
 
         if has_native_thinking && !text_content.is_empty() {
@@ -1624,6 +1633,7 @@ pub async fn post_messages_cc(
             &payload.model,
             total_input_tokens,
             thinking_enabled,
+            false,
             tool_name_map,
             known_tool_names,
             hook,
@@ -1649,6 +1659,7 @@ pub async fn post_messages_cc(
             &payload.model,
             total_input_tokens,
             extract_thinking,
+            false,
             tool_name_map,
             known_tool_names,
             hook,
@@ -1941,6 +1952,7 @@ mod tests {
     fn non_stream_native_thinking_precedes_redacted_and_text() {
         let content = build_non_stream_content(
             true,
+            true,
             "final answer".to_string(),
             "native thinking".to_string(),
             Some("real-signature".to_string()),
@@ -1958,8 +1970,26 @@ mod tests {
     }
 
     #[test]
+    fn non_stream_cc_compat_suppresses_redacted_thinking() {
+        let content = build_non_stream_content(
+            true,
+            false,
+            "final answer".to_string(),
+            "native thinking".to_string(),
+            Some("real-signature".to_string()),
+            vec!["encrypted-thinking".to_string()],
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[1]["type"], "text");
+        assert!(content.iter().all(|block| block["type"] != "redacted_thinking"));
+    }
+
+    #[test]
     fn non_stream_legacy_thinking_extraction_still_works_without_native_reasoning() {
         let content = build_non_stream_content(
+            true,
             true,
             "<thinking>legacy thinking</thinking>\n\nfinal answer".to_string(),
             String::new(),
@@ -1982,6 +2012,7 @@ mod tests {
     fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
         let content = build_non_stream_content(
             false,
+            true,
             String::new(),
             "native thinking fallback".to_string(),
             Some("ignored-signature".to_string()),

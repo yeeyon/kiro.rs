@@ -1441,4 +1441,3 @@ mod tests {
         assert!(Generation::new(10, 0) > Generation::new(9, 9));
     }
 }
-

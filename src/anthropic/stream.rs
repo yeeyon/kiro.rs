@@ -1385,6 +1385,9 @@ pub struct StreamContext {
     pub fence_scan_partial: String,
     /// thinking 是否启用
     pub thinking_enabled: bool,
+    /// 是否向客户端发送 Anthropic `redacted_thinking` 块。
+    /// Claude Code 兼容路径关闭它，避免 VS Code 扩展报未知 content type。
+    emit_redacted_thinking: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// invoke 文本嗅探缓冲区（用于从明文流里嗅探字面 `<invoke>` 工具调用块）
@@ -1467,6 +1470,7 @@ impl StreamContext {
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
+            emit_redacted_thinking: true,
             thinking_buffer: String::new(),
             invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
@@ -1485,6 +1489,11 @@ impl StreamContext {
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
+    }
+
+    /// 配置是否输出 Anthropic 专用的 `redacted_thinking` content block。
+    pub fn set_emit_redacted_thinking(&mut self, emit: bool) {
+        self.emit_redacted_thinking = emit;
     }
 
     /// 生成 message_start 事件
@@ -2163,7 +2172,8 @@ impl StreamContext {
             }
         }
 
-        if let Some(redacted) = reasoning.redacted_content.as_deref()
+        if self.emit_redacted_thinking
+            && let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
             self.output_tokens += 8;
@@ -4727,6 +4737,25 @@ mod tests {
             e.event == "content_block_start"
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
+        }));
+    }
+
+    #[test]
+    fn test_cc_compat_suppresses_native_redacted_thinking() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), std::collections::HashSet::new());
+        ctx.set_emit_redacted_thinking(false);
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: None,
+                signature: None,
+                redacted_content: Some("encrypted-thinking".to_string()),
+            },
+        )));
+
+        assert!(!all_events.iter().any(|e| {
+            e.data["content_block"]["type"] == "redacted_thinking"
         }));
     }
 
