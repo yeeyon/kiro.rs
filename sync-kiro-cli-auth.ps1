@@ -30,12 +30,16 @@ param(
     [switch]$Watch,
     [string]$CacheDir     = (Join-Path $env:USERPROFILE ".aws\sso\cache"),
     [string]$TokenFile    = "kiro-auth-token.json",
-    [string]$CredsPath    = "C:\Users\User\kiro\data\credentials.json",
+    [string]$CredsPath,
     [int]   $EntryId      = 2,
     [int]   $Priority     = 0
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $CredsPath) {
+    $CredsPath = Join-Path $PSScriptRoot "data\credentials.json"
+}
 
 function Write-Log([string]$msg) {
     Write-Host ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $msg)
@@ -114,6 +118,9 @@ function Sync-Once {
     # Atomic write: temp file in same dir, then move over.
     # Use BOM-less UTF-8 (PowerShell 5.1 -Encoding UTF8 emits a BOM that serde_json rejects).
     $dir = Split-Path -Parent $CredsPath
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
     $tmp = Join-Path $dir (".credentials.{0}.tmp" -f ([guid]::NewGuid().ToString("N")))
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($tmp, $json, $utf8NoBom)

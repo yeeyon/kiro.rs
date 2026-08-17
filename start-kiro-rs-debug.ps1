@@ -1,9 +1,14 @@
 # Debug startup for kiro-rs with verbose logging
-$bin_path = "c:\Users\User\kiro\target\release\kiro-rs.exe"
-$config_path = "c:\Users\User\kiro\data\config.json"
-$credentials_path = "c:\Users\User\kiro\data\credentials.json"
-$log_file = "c:\Users\User\kiro\data\kiro-rs-native.log"
-$log_err_file = "c:\Users\User\kiro\data\kiro-rs-native-error.log"
+$root = $PSScriptRoot
+$data_path = Join-Path $root "data"
+$bin_path = Join-Path $root "target\release\kiro-rs.exe"
+$config_path = Join-Path $data_path "config.json"
+$credentials_path = Join-Path $data_path "credentials.json"
+$log_file = Join-Path $data_path "kiro-rs-native.log"
+$log_err_file = Join-Path $data_path "kiro-rs-native-error.log"
+
+New-Item -ItemType Directory -Path $data_path -Force | Out-Null
+& (Join-Path $root "sync-kiro-cli-auth.ps1") -Once -CredsPath $credentials_path
 
 Stop-Process -Name "kiro-rs" -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1

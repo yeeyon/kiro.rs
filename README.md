@@ -39,7 +39,7 @@
 
 - **Anthropic Messages API 兼容**：`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens`。
 - **OpenAI API 兼容**：`/v1/chat/completions` 和 `/v1/responses`，支持非流式响应与合成 SSE，可供 OpenAI SDK 和新版 Codex CLI 使用。
-- **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
+- **Claude Code 兼容端点**：`/cc/v1/models`、`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
 - **GPT-5.6 模型族**：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
@@ -294,6 +294,7 @@ codex
 | `GET` | `/v1/models` | 返回本服务声明支持的模型列表 |
 | `POST` | `/v1/messages` | Anthropic Messages API 兼容入口 |
 | `POST` | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容入口 |
+| `GET` | `/cc/v1/models` | Claude Code gateway 模型发现，与 `/v1/models` 相同 |
 | `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
 | `POST` | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens |
 
