@@ -20,18 +20,21 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::kiro::model::events::{Event, MeteringEvent};
+use crate::admin::trace_db::outcome;
+use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
-use crate::model::config::ToolCompatibilityMode;
-use super::handlers::{UsageRecordHook, map_provider_error};
+use super::handlers::{
+    RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
+};
 use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
+use crate::model::config::ToolCompatibilityMode;
 
 /// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
 const MAX_WEB_SEARCH_ROUNDS: usize = 5;
@@ -61,6 +64,8 @@ struct RoundOutcome {
     tool_uses: Vec<CompletedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
     context_input_tokens: Option<i32>,
+    /// metadataEvent.tokenUsage 的单轮精确最终快照。
+    provider_token_usage: Option<TokenUsage>,
     /// Cumulative credits from meteringEvent (sum of usage across rounds)
     credits: f64,
     /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
@@ -69,9 +74,9 @@ struct RoundOutcome {
     last_metering: Option<MeteringEvent>,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
-    /// True if the upstream stream ended due to a read error, so the decoded
-    /// content for this round is partial and must not be treated as a success.
-    stream_error: bool,
+    /// Upstream body-read error, if any. Content decoded before this error is
+    /// partial and must not be treated as a successful round.
+    stream_error: Option<String>,
     /// Tool names declared to the upstream this round (original + shortened),
     /// taken from `ConversionResult::known_tool_names`. Used by the shared
     /// `<invoke>` text-leak fault tolerance so a leaked `<invoke name=...>` is only
@@ -81,6 +86,38 @@ struct RoundOutcome {
     /// `ConversionResult::tool_name_map`. Used to restore the original tool name when a
     /// leaked `<invoke>` carries a shortened (>63 char) tool name.
     tool_name_map: std::collections::HashMap<String, String>,
+}
+
+impl RoundOutcome {
+    /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时只回退本轮。
+    fn resolved_token_usage(&self, fallback_input_tokens: i32) -> TokenUsage {
+        if let Some(usage) = self.provider_token_usage {
+            return usage.sanitized();
+        }
+
+        let mut output = Vec::new();
+        if !self.thinking.is_empty() {
+            output.push(json!({"type": "thinking", "thinking": self.thinking}));
+        }
+        if !self.text.is_empty() {
+            output.push(json!({"type": "text", "text": self.text}));
+        }
+        output.extend(
+            self.tool_uses
+                .iter()
+                .map(CompletedToolUse::to_anthropic_block),
+        );
+
+        TokenUsage {
+            uncached_input_tokens: self
+                .context_input_tokens
+                .unwrap_or(fallback_input_tokens)
+                .max(0),
+            output_tokens: token::estimate_output_tokens(&output),
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+        }
+    }
 }
 
 /// Normalize model-produced Web Search input into one non-empty query.
@@ -131,12 +168,6 @@ fn log_invalid_web_search_input(tu: &CompletedToolUse) {
     );
 }
 
-fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
-    error
-        .to_string()
-        .contains("MCP error: -32602 - Tool returned no results")
-}
-
 fn log_normalized_web_search_query(tu: &CompletedToolUse, query: &str) {
     tracing::info!(
         tool_use_id = %tu.id,
@@ -150,8 +181,7 @@ fn log_normalized_web_search_query(tu: &CompletedToolUse, query: &str) {
 /// Continue condition: every tool_use this round is web_search (at least one) and the round limit has not been reached.
 /// As soon as a client tool such as exec is mixed in, there is no tool_use at all, or the limit is reached, it stops and flushes (exec is never swallowed).
 fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
-    let only_web_search =
-        !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
+    let only_web_search = !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
 }
 
@@ -196,6 +226,7 @@ async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    tracer: &RequestTracer,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -208,17 +239,21 @@ async fn decode_round(
     let mut order: Vec<String> = Vec::new();
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
+    let mut provider_token_usage: Option<TokenUsage> = None;
     let mut credits = 0.0;
     let mut last_metering: Option<MeteringEvent> = None;
     let mut stop_reason_override: Option<String> = None;
-    let mut stream_error = false;
+    let mut stream_error = None;
 
     while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
-            Ok(c) => c,
+            Ok(c) => {
+                tracer.mark_first_token();
+                c
+            }
             Err(e) => {
                 tracing::error!("web_search loop failed to read the response stream: {}", e);
-                stream_error = true;
+                stream_error = Some(e.to_string());
                 break;
             }
         };
@@ -253,6 +288,12 @@ async fn decode_round(
                         entry.0 = tu.name.clone();
                     }
                     entry.1.push_str(&tu.input);
+                }
+                Event::Metadata(metadata) => {
+                    if let Some(usage) = metadata.token_usage {
+                        // 单条流内重复 metadata 是快照，取最后一份。
+                        provider_token_usage = Some(usage.sanitized());
+                    }
                 }
                 Event::ContextUsage(cu) => {
                     let window = get_context_window_size(model);
@@ -300,6 +341,7 @@ async fn decode_round(
         thinking,
         tool_uses,
         context_input_tokens,
+        provider_token_usage,
         credits,
         last_metering,
         stop_reason_override,
@@ -311,24 +353,36 @@ async fn decode_round(
     }
 }
 
-/// Run one upstream round (convert + streaming request + buffer decode)
+/// A failed round plus any usage that can still be attributed to its provider call.
+struct RoundFailure {
+    response: Response,
+    error_type: &'static str,
+    error_message: String,
+    credential_id: u64,
+    token_usage: Option<TokenUsage>,
+    credits: f64,
+}
+
+/// Run one upstream round (convert + streaming request + buffer decode).
 ///
-/// On upstream/conversion failure, returns Err(an already-constructed pass-through error Response)
+/// Usage recording belongs to the outer loop so every terminal path writes exactly one
+/// aggregate. A failure after a provider call carries the usage already observed in that call.
 async fn run_round(
     provider: &Arc<KiroProvider>,
     payload: &MessagesRequest,
-    hook: &UsageRecordHook,
     fallback_input_tokens: i32,
+    tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
-) -> Result<(RoundOutcome, u64), Response> {
+) -> Result<(RoundOutcome, u64), RoundFailure> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
-                ConversionError::InvalidModel(reason) => {
-                    ("invalid_request_error", format!("invalid model id: {}", reason))
-                }
+                ConversionError::InvalidModel(reason) => (
+                    "invalid_request_error",
+                    format!("invalid model id: {}", reason),
+                ),
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
@@ -337,8 +391,16 @@ async fn run_round(
                     format!("unsupported tool mapping: {}", reason),
                 ),
             };
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
+            let error_message = msg.clone();
+            return Err(RoundFailure {
+                response: (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg)))
+                    .into_response(),
+                error_type: outcome::BAD_REQUEST,
+                error_message,
+                credential_id: 0,
+                token_usage: None,
+                credits: 0.0,
+            });
         }
     };
 
@@ -350,42 +412,76 @@ async fn run_round(
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(b) => b,
         Err(e) => {
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("internal_error", format!("failed to serialize request: {}", e))),
-            )
-                .into_response());
+            let error_message = format!("failed to serialize request: {}", e);
+            return Err(RoundFailure {
+                response: (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("internal_error", error_message.clone())),
+                )
+                    .into_response(),
+                error_type: outcome::UNKNOWN,
+                error_message,
+                credential_id: 0,
+                token_usage: None,
+                credits: 0.0,
+            });
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    let call_result = match provider
+        .call_api_stream(&request_body, Some(tracer), group)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            return Err(map_provider_error(e));
+            let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
+            let error_message = e.to_string();
+            return Err(RoundFailure {
+                response: map_provider_error(e),
+                error_type,
+                error_message,
+                credential_id: 0,
+                token_usage: Some(TokenUsage {
+                    uncached_input_tokens: fallback_input_tokens.max(0),
+                    ..TokenUsage::default()
+                }),
+                credits: 0.0,
+            });
         }
     };
     let credential_id = call_result.credential_id;
-    let mut outcome =
-        decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
+    let mut outcome = decode_round(
+        call_result.response,
+        &payload.model,
+        &conversion.tool_name_map,
+        tracer,
+    )
+    .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
     outcome.known_tool_names = conversion.known_tool_names;
     // Carry the short->original tool name map so reclaimed <invoke> names get restored.
     outcome.tool_name_map = conversion.tool_name_map;
-    if outcome.stream_error {
-        // The upstream stream was cut off mid-round; the decoded content is partial,
-        // so fail the round instead of feeding truncated text/tool_use back into the loop.
-        hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
-                "upstream_error",
-                "Upstream response stream ended unexpectedly during the web_search loop.".to_string(),
-            )),
-        )
-            .into_response());
+    if let Some(error_message) = outcome.stream_error.take() {
+        // The stream is partial and cannot re-enter the search loop, but any final metadata
+        // snapshot/credits observed before the cut still belong to this real provider call.
+        let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
+        return Err(RoundFailure {
+            response: (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "upstream_error",
+                    "Upstream response stream ended unexpectedly during the web_search loop."
+                        .to_string(),
+                )),
+            )
+                .into_response(),
+            error_type: outcome::STREAM_INTERRUPTED,
+            error_message,
+            credential_id,
+            token_usage: Some(token_usage),
+            credits: outcome.credits,
+        });
     }
     Ok((outcome, credential_id))
 }
@@ -588,7 +684,8 @@ fn build_flush_content(
             .filter(|t| t.name != "web_search")
             .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
             .collect();
-        for block in super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
+        for block in
+            super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
         {
             if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -631,6 +728,57 @@ fn build_flush_content(
     content
 }
 
+fn record_aggregated_usage(
+    hook: &UsageRecordHook,
+    credential_id: u64,
+    usage: TokenUsage,
+    credits: f64,
+    status: &str,
+) {
+    let usage = usage.sanitized();
+    hook.record(
+        credential_id,
+        usage.uncached_input_tokens,
+        usage.output_tokens,
+        usage.cache_write_input_tokens,
+        usage.cache_read_input_tokens,
+        credits,
+        status,
+    );
+}
+
+fn aggregated_trace_usage(usage: TokenUsage, credits: f64) -> TraceUsage {
+    let usage = usage.sanitized();
+    TraceUsage {
+        input_tokens: usage.uncached_input_tokens as u64,
+        output_tokens: usage.output_tokens as u64,
+        cache_creation_tokens: usage.cache_write_input_tokens as u64,
+        cache_read_tokens: usage.cache_read_input_tokens as u64,
+        credits: if credits.is_finite() && credits > 0.0 {
+            credits
+        } else {
+            0.0
+        },
+    }
+}
+
+fn finalize_aggregated_trace(
+    tracer: &RequestTracer,
+    status: &str,
+    error_type: Option<&str>,
+    error_message: Option<&str>,
+    usage: TokenUsage,
+    credits: f64,
+) {
+    tracer.finalize(
+        status,
+        error_type,
+        error_message,
+        None,
+        aggregated_trace_usage(usage, credits),
+    );
+}
+
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
@@ -638,20 +786,14 @@ pub(super) async fn run_web_search_loop(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
     hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
-    let fallback_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
-    ) as i32;
-
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
-    let mut last_context_input: Option<i32> = None;
+    let mut total_token_usage = TokenUsage::default();
     let mut total_credits = 0.0;
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
@@ -659,22 +801,52 @@ pub(super) async fn run_web_search_loop(
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
         let round = loop {
-            let (round, credential_id) =
-                match run_round(
-                    &provider,
-                    &payload,
-                    &hook,
-                    fallback_input_tokens,
-                    group.as_deref(),
-                    tool_compatibility_mode,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(resp) => return resp,
-                };
+            let round_fallback_input_tokens = token::count_all_tokens(
+                payload.model.clone(),
+                payload.system.clone(),
+                payload.messages.clone(),
+                payload.tools.clone(),
+            ) as i32;
+            let (round, credential_id) = match run_round(
+                &provider,
+                &payload,
+                round_fallback_input_tokens,
+                tracer.as_ref(),
+                group.as_deref(),
+                tool_compatibility_mode,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(failure) => {
+                    if failure.credential_id != 0 {
+                        last_credential_id = failure.credential_id;
+                    }
+                    if let Some(usage) = failure.token_usage {
+                        total_token_usage = total_token_usage.saturating_add(usage);
+                    }
+                    total_credits += failure.credits;
+                    record_aggregated_usage(
+                        &hook,
+                        last_credential_id,
+                        total_token_usage,
+                        total_credits,
+                        "error",
+                    );
+                    finalize_aggregated_trace(
+                        tracer.as_ref(),
+                        "error",
+                        Some(failure.error_type),
+                        Some(&failure.error_message),
+                        total_token_usage,
+                        total_credits,
+                    );
+                    return failure.response;
+                }
+            };
             last_credential_id = credential_id;
-            last_context_input = round.context_input_tokens.or(last_context_input);
+            total_token_usage = total_token_usage
+                .saturating_add(round.resolved_token_usage(round_fallback_input_tokens));
             total_credits += round.credits;
             // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
             // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
@@ -694,15 +866,22 @@ pub(super) async fn run_web_search_loop(
                     continue;
                 }
                 EmptyToolResultDisposition::Fail => {
-                    let final_input = last_context_input.unwrap_or(fallback_input_tokens);
-                    hook.record(
+                    record_aggregated_usage(
+                        &hook,
                         last_credential_id,
-                        final_input,
-                        0,
-                        0,
-                        0,
+                        total_token_usage,
                         total_credits,
                         "error",
+                    );
+                    finalize_aggregated_trace(
+                        tracer.as_ref(),
+                        "error",
+                        Some(outcome::UNKNOWN),
+                        Some(
+                            "Upstream returned no assistant text or tool call after a tool result.",
+                        ),
+                        total_token_usage,
+                        total_credits,
                     );
                     tracing::error!(
                         round = round_idx,
@@ -735,7 +914,8 @@ pub(super) async fn run_web_search_loop(
 
         if should_search_round(round_idx, &round.tool_uses) {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
-            let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
+            let mut searched: Vec<Option<WebSearchResults>> =
+                Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
                 let Some(query) = tool_query(tu) else {
                     log_invalid_web_search_input(tu);
@@ -744,22 +924,38 @@ pub(super) async fn run_web_search_loop(
                 };
                 log_normalized_web_search_query(tu, &query);
                 let (_id, mcp_request) = websearch::create_mcp_request(&query);
-                match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
+                match websearch::call_mcp_api(
+                    &provider,
+                    &mcp_request,
+                    Some(tracer.as_ref()),
+                    group.as_deref(),
+                )
+                .await
+                {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
-                    Err(e) if is_no_results_mcp_error(&e) => {
-                        tracing::warn!("web_search MCP returned no results; continuing with an empty result");
+                    Err(e) if websearch::is_no_results_mcp_error(&e) => {
+                        tracing::warn!(
+                            "web_search MCP returned no results; continuing with an empty result"
+                        );
                         searched.push(None);
                     }
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
-                        hook.record(
+                        let error_message = e.to_string();
+                        record_aggregated_usage(
+                            &hook,
                             last_credential_id,
-                            fallback_input_tokens,
-                            0,
-                            0,
-                            0,
+                            total_token_usage,
                             total_credits,
                             "error",
+                        );
+                        finalize_aggregated_trace(
+                            tracer.as_ref(),
+                            "error",
+                            last_attempt_outcome(tracer.as_ref()),
+                            Some(&error_message),
+                            total_token_usage,
+                            total_credits,
                         );
                         return map_provider_error(e);
                     }
@@ -775,7 +971,6 @@ pub(super) async fn run_web_search_loop(
         // web_search must end as "end_turn", not "tool_use" (otherwise the host would
         // wait for a client tool call that is never emitted).
         let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
-        let final_input = last_context_input.unwrap_or(fallback_input_tokens);
         // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
         // as a raw tool_use (the Codex host has no executor for it and rejects it
         // with "unsupported call: web_search"). This covers the mixed-round case
@@ -793,22 +988,38 @@ pub(super) async fn run_web_search_loop(
                 };
                 log_normalized_web_search_query(tu, &query);
                 let (_id, mcp_request) = websearch::create_mcp_request(&query);
-                match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
+                match websearch::call_mcp_api(
+                    &provider,
+                    &mcp_request,
+                    Some(tracer.as_ref()),
+                    group.as_deref(),
+                )
+                .await
+                {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
-                    Err(e) if is_no_results_mcp_error(&e) => {
-                        tracing::warn!("web_search MCP returned no results in final round; continuing with an empty result");
+                    Err(e) if websearch::is_no_results_mcp_error(&e) => {
+                        tracing::warn!(
+                            "web_search MCP returned no results in final round; continuing with an empty result"
+                        );
                         searched.push(None);
                     }
                     Err(e) => {
                         tracing::warn!("web_search MCP call (final round) failed: {}", e);
-                        hook.record(
+                        let error_message = e.to_string();
+                        record_aggregated_usage(
+                            &hook,
                             last_credential_id,
-                            fallback_input_tokens,
-                            0,
-                            0,
-                            0,
+                            total_token_usage,
                             total_credits,
                             "error",
+                        );
+                        finalize_aggregated_trace(
+                            tracer.as_ref(),
+                            "error",
+                            last_attempt_outcome(tracer.as_ref()),
+                            Some(&error_message),
+                            total_token_usage,
+                            total_credits,
                         );
                         return map_provider_error(e);
                     }
@@ -835,15 +1046,21 @@ pub(super) async fn run_web_search_loop(
             &content,
         );
 
-        let output_tokens = token::estimate_output_tokens(&content);
-        hook.record(
+        let final_usage = total_token_usage.sanitized();
+        record_aggregated_usage(
+            &hook,
             last_credential_id,
-            final_input,
-            output_tokens,
-            0,
-            0,
+            final_usage,
             total_credits,
             "success",
+        );
+        finalize_aggregated_trace(
+            tracer.as_ref(),
+            "success",
+            None,
+            None,
+            final_usage,
+            total_credits,
         );
 
         return if stream_client {
@@ -851,8 +1068,7 @@ pub(super) async fn run_web_search_loop(
                 &payload.model,
                 content,
                 &stop_reason,
-                final_input,
-                output_tokens,
+                final_usage,
                 latest_metering.as_ref(),
             )
         } else {
@@ -860,8 +1076,7 @@ pub(super) async fn run_web_search_loop(
                 &payload.model,
                 content,
                 &stop_reason,
-                final_input,
-                output_tokens,
+                final_usage,
                 &all_thinking,
                 latest_metering.as_ref(),
             )
@@ -869,10 +1084,27 @@ pub(super) async fn run_web_search_loop(
     }
 
     // Theoretically unreachable (the loop always returns)
-    hook.record(last_credential_id, fallback_input_tokens, 0, 0, 0, total_credits, "error");
+    record_aggregated_usage(
+        &hook,
+        last_credential_id,
+        total_token_usage,
+        total_credits,
+        "error",
+    );
+    finalize_aggregated_trace(
+        tracer.as_ref(),
+        "error",
+        Some(outcome::UNKNOWN),
+        Some("web_search loop exited unexpectedly"),
+        total_token_usage,
+        total_credits,
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new("internal_error", "web_search loop exited unexpectedly")),
+        Json(ErrorResponse::new(
+            "internal_error",
+            "web_search loop exited unexpectedly",
+        )),
     )
         .into_response()
 }
@@ -888,16 +1120,16 @@ pub(crate) fn render_json(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
-    input_tokens: i32,
-    output_tokens: i32,
+    token_usage: TokenUsage,
     thinking: &str,
     metering: Option<&MeteringEvent>,
 ) -> Response {
+    let token_usage = token_usage.sanitized();
     let mut usage = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0
+        "input_tokens": token_usage.uncached_input_tokens,
+        "output_tokens": token_usage.output_tokens,
+        "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
+        "cache_read_input_tokens": token_usage.cache_read_input_tokens
     });
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径
     // 一致的计费元数据；只在收到过 meteringEvent 时才追加。
@@ -927,11 +1159,10 @@ pub(crate) fn render_sse(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
-    input_tokens: i32,
-    output_tokens: i32,
+    token_usage: TokenUsage,
     metering: Option<&MeteringEvent>,
 ) -> Response {
-    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens, metering);
+    let events = build_sse_events(model, content, stop_reason, token_usage, metering);
     let stream = stream::iter(
         events
             .into_iter()
@@ -951,15 +1182,12 @@ fn build_sse_events(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
-    input_tokens: i32,
-    output_tokens: i32,
+    token_usage: TokenUsage,
     metering: Option<&MeteringEvent>,
 ) -> Vec<SseEvent> {
+    let token_usage = token_usage.sanitized();
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        &Uuid::new_v4().to_string().replace('-', "")[..24]
-    );
+    let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
 
     events.push(SseEvent::new(
         "message_start",
@@ -974,10 +1202,10 @@ fn build_sse_events(
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": token_usage.uncached_input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
+                    "cache_read_input_tokens": token_usage.cache_read_input_tokens
                 }
             }
         }),
@@ -989,61 +1217,91 @@ fn build_sse_events(
         match btype {
             "text" => {
                 let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                events.push(SseEvent::new("content_block_start", json!({
-                    "type": "content_block_start", "index": index,
-                    "content_block": {"type": "text", "text": ""}
-                })));
-                events.push(SseEvent::new("content_block_delta", json!({
-                    "type": "content_block_delta", "index": index,
-                    "delta": {"type": "text_delta", "text": text}
-                })));
-                events.push(SseEvent::new("content_block_stop", json!({
-                    "type": "content_block_stop", "index": index
-                })));
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": text}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop", "index": index
+                    }),
+                ));
             }
             "tool_use" => {
                 let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
                 let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-                events.push(SseEvent::new("content_block_start", json!({
-                    "type": "content_block_start", "index": index,
-                    "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
-                })));
-                events.push(SseEvent::new("content_block_delta", json!({
-                    "type": "content_block_delta", "index": index,
-                    "delta": {"type": "input_json_delta", "partial_json": partial}
-                })));
-                events.push(SseEvent::new("content_block_stop", json!({
-                    "type": "content_block_stop", "index": index
-                })));
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": partial}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop", "index": index
+                    }),
+                ));
             }
             "server_tool_use" | "web_search_tool_result" => {
-                events.push(SseEvent::new("content_block_start", json!({
-                    "type": "content_block_start", "index": index,
-                    "content_block": block
-                })));
-                events.push(SseEvent::new("content_block_stop", json!({
-                    "type": "content_block_stop", "index": index
-                })));
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": block
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop", "index": index
+                    }),
+                ));
             }
             _ => {}
         }
     }
 
-    let mut message_delta_usage = json!({ "output_tokens": output_tokens });
+    let mut message_delta_usage = json!({ "output_tokens": token_usage.output_tokens });
     // 透传上游 meteringEvent 的 credit_* 字段（仅在拿到 meteringEvent 时）。
     if let Some(m) = metering {
         message_delta_usage["credit_usage"] = json!(m.usage);
         message_delta_usage["credit_unit"] = json!(m.unit);
         message_delta_usage["credit_unit_plural"] = json!(m.unit_plural);
     }
-    events.push(SseEvent::new("message_delta", json!({
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason},
-        "usage": message_delta_usage
-    })));
-    events.push(SseEvent::new("message_stop", json!({"type": "message_stop"})));
+    events.push(SseEvent::new(
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": message_delta_usage
+        }),
+    ));
+    events.push(SseEvent::new(
+        "message_stop",
+        json!({"type": "message_stop"}),
+    ));
 
     events
 }
@@ -1071,10 +1329,22 @@ mod tests {
 
     #[test]
     fn tool_query_normalizes_supported_input_shapes() {
-        assert_eq!(tool_query(&tu_with_input(json!({"query": "  rust 2026  "}))), Some("rust 2026".to_string()));
-        assert_eq!(tool_query(&tu_with_input(json!({"search_query": "南京演唱会"}))), Some("南京演唱会".to_string()));
-        assert_eq!(tool_query(&tu_with_input(json!({"queries": ["", "上海天气"]}))), Some("上海天气".to_string()));
-        assert_eq!(tool_query(&tu_with_input(json!({"query": {"text": "Paris weather"}}))), Some("Paris weather".to_string()));
+        assert_eq!(
+            tool_query(&tu_with_input(json!({"query": "  rust 2026  "}))),
+            Some("rust 2026".to_string())
+        );
+        assert_eq!(
+            tool_query(&tu_with_input(json!({"search_query": "南京演唱会"}))),
+            Some("南京演唱会".to_string())
+        );
+        assert_eq!(
+            tool_query(&tu_with_input(json!({"queries": ["", "上海天气"]}))),
+            Some("上海天气".to_string())
+        );
+        assert_eq!(
+            tool_query(&tu_with_input(json!({"query": {"text": "Paris weather"}}))),
+            Some("Paris weather".to_string())
+        );
     }
 
     #[test]
@@ -1086,8 +1356,12 @@ mod tests {
 
     #[test]
     fn no_results_mcp_error_is_nonfatal() {
-        assert!(is_no_results_mcp_error(&anyhow::anyhow!("MCP error: -32602 - Tool returned no results")));
-        assert!(!is_no_results_mcp_error(&anyhow::anyhow!("MCP error: -32602 - Invalid tool parameters provided")));
+        assert!(websearch::is_no_results_mcp_error(&anyhow::anyhow!(
+            "MCP error: -32602 - Tool returned no results"
+        )));
+        assert!(!websearch::is_no_results_mcp_error(&anyhow::anyhow!(
+            "MCP error: -32602 - Invalid tool parameters provided"
+        )));
     }
 
     /// Build a known-tool-names set for build_flush_content tests.
@@ -1133,10 +1407,11 @@ mod tests {
             thinking: String::new(),
             tool_uses,
             context_input_tokens: None,
+            provider_token_usage: None,
             credits: 0.0,
             last_metering: None,
             stop_reason_override: None,
-            stream_error: false,
+            stream_error: None,
             known_tool_names: std::collections::HashSet::new(),
             tool_name_map: std::collections::HashMap::new(),
         }
@@ -1322,7 +1597,13 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5, None);
+        let events = build_sse_events(
+            "claude-sonnet-4-8",
+            content,
+            "tool_use",
+            token_usage(10, 5),
+            None,
+        );
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");
@@ -1332,17 +1613,22 @@ mod tests {
 
         // the server_tool_use block is placed into content_block_start as-is
         let has_server_tool = events.iter().any(|e| {
-            e.event == "content_block_start"
-                && e.data["content_block"]["type"] == "server_tool_use"
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "server_tool_use"
         });
-        assert!(has_server_tool, "the server_tool_use block should be presented");
+        assert!(
+            has_server_tool,
+            "the server_tool_use block should be presented"
+        );
 
         // the web_search_tool_result block is presented
         let has_result = events.iter().any(|e| {
             e.event == "content_block_start"
                 && e.data["content_block"]["type"] == "web_search_tool_result"
         });
-        assert!(has_result, "the web_search_tool_result block should be presented");
+        assert!(
+            has_result,
+            "the web_search_tool_result block should be presented"
+        );
 
         // exec tool_use is not swallowed: name=exec appears in start
         let has_exec = events.iter().any(|e| {
@@ -1350,7 +1636,10 @@ mod tests {
                 && e.data["content_block"]["type"] == "tool_use"
                 && e.data["content_block"]["name"] == "exec"
         });
-        assert!(has_exec, "the exec tool_use must be returned to the client as-is and not swallowed");
+        assert!(
+            has_exec,
+            "the exec tool_use must be returned to the client as-is and not swallowed"
+        );
     }
     // ---- INVARIANT: web_search must NEVER leave kiro-rs as a raw tool_use ----
     // Regression for the "mixed-round leak": when the final round mixes web_search
@@ -1382,8 +1671,14 @@ mod tests {
     fn flush_content_mixed_round_never_emits_raw_web_search() {
         let tool_uses = vec![tu("web_search"), tu("exec")];
         let searched = vec![fake_results("rust 2026"), None];
-        let content =
-            build_flush_content(Vec::new(), "answer", &tool_uses, &searched, &names(&["exec"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            "answer",
+            &tool_uses,
+            &searched,
+            &names(&["exec"]),
+            &nomap(),
+        );
 
         let raw_web_search = content
             .iter()
@@ -1424,7 +1719,14 @@ mod tests {
     fn flush_content_client_tools_only_passthrough() {
         let tool_uses = vec![tu("exec")];
         let searched: Vec<Option<WebSearchResults>> = vec![None];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&["exec"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            "",
+            &tool_uses,
+            &searched,
+            &names(&["exec"]),
+            &nomap(),
+        );
         assert!(
             content
                 .iter()
@@ -1468,10 +1770,17 @@ mod tests {
             content
         );
         let reclaimed = content.iter().find(|c| c["type"] == "tool_use");
-        assert!(reclaimed.is_some(), "must reclaim a structured tool_use. content={:?}", content);
+        assert!(
+            reclaimed.is_some(),
+            "must reclaim a structured tool_use. content={:?}",
+            content
+        );
         let tu = reclaimed.unwrap();
         assert_eq!(tu["name"], "exec_command");
-        assert_eq!(tu["input"]["cmd"], "echo hi", "parameter must be parsed into input");
+        assert_eq!(
+            tu["input"]["cmd"], "echo hi",
+            "parameter must be parsed into input"
+        );
         // the stray `call` line in front of the invoke must be stripped, not leaked
         assert!(
             !content
@@ -1486,15 +1795,29 @@ mod tests {
         // Narrative text before the leaked invoke must be preserved as a text block,
         // and the invoke still reclaimed.
         let leaked = "Here is the result.\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(!leaks_literal_invoke(&content));
         assert!(
             content.iter().any(|c| c["type"] == "text"
-                && c["text"].as_str().unwrap_or("").contains("Here is the result.")),
+                && c["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Here is the result.")),
             "narrative text must be preserved. content={:?}",
             content
         );
-        assert!(content.iter().any(|c| c["type"] == "tool_use" && c["name"] == "exec_command"));
+        assert!(
+            content
+                .iter()
+                .any(|c| c["type"] == "tool_use" && c["name"] == "exec_command")
+        );
     }
 
     // ---- SAFETY GATES: must NOT reclaim (would risk executing discussed commands) ----
@@ -1504,7 +1827,14 @@ mod tests {
         // An <invoke> shown inside a ``` code fence is a DISPLAY/discussion, not a real call.
         // It must stay as text, never become a tool_use.
         let text = "Look at this example:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            text,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "fenced <invoke> must NOT be reclaimed (it's a display). content={:?}",
@@ -1516,7 +1846,14 @@ mod tests {
     fn flush_content_does_not_reclaim_invoke_mid_sentence() {
         // <invoke> embedded mid-sentence (not at line start) is discussion text, not a call.
         let text = "the tag <invoke name=\"exec_command\"><parameter name=\"cmd\">x</parameter></invoke> means a call";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            text,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "mid-sentence <invoke> must NOT be reclaimed. content={:?}",
@@ -1529,7 +1866,14 @@ mod tests {
         // Tool-table guard: a clean line-start <invoke> whose name is NOT a declared tool
         // must NOT be reclaimed (never synthesize a call for an unknown tool).
         let leaked = "call\n<invoke name=\"definitely_not_a_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unknown tool name must NOT be reclaimed. content={:?}",
@@ -1604,7 +1948,14 @@ mod tests {
     #[test]
     fn flush_content_clean_text_is_single_text_block() {
         // No <invoke> at all -> behavior identical to before: one text block, unchanged.
-        let content = build_flush_content(Vec::new(), "just a normal answer", &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            "just a normal answer",
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "just a normal answer");
@@ -1624,7 +1975,12 @@ mod tests {
         );
         assert!(!leaks_literal_invoke(&content));
         let tus: Vec<&Value> = content.iter().filter(|c| c["type"] == "tool_use").collect();
-        assert_eq!(tus.len(), 2, "both invokes reclaimed. content={:?}", content);
+        assert_eq!(
+            tus.len(),
+            2,
+            "both invokes reclaimed. content={:?}",
+            content
+        );
         assert_eq!(tus[0]["name"], "exec_command");
         assert_eq!(tus[0]["input"]["cmd"], "a");
         assert_eq!(tus[1]["name"], "get_time");
@@ -1635,7 +1991,14 @@ mod tests {
     fn flush_content_unclosed_invoke_stays_text() {
         // An <invoke> with no closing tag in the complete text is not a clean call -> keep as text.
         let text = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            text,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unclosed <invoke> must NOT be reclaimed. content={:?}",
@@ -1656,14 +2019,7 @@ mod tests {
         );
         let mut map = std::collections::HashMap::new();
         map.insert(short.to_string(), original.to_string());
-        let content = build_flush_content(
-            Vec::new(),
-            &leaked,
-            &[],
-            &[],
-            &names(&[short]),
-            &map,
-        );
+        let content = build_flush_content(Vec::new(), &leaked, &[], &[], &names(&[short]), &map);
         let tu = content
             .iter()
             .find(|c| c["type"] == "tool_use")
@@ -1683,7 +2039,14 @@ mod tests {
         // stop_reason="tool_use". This test pins that contract: a leaked invoke with an empty
         // tool_uses list still yields a client tool_use block in the content.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         let has_client_tool_use = content
             .iter()
             .any(|c| c["type"] == "tool_use" && c["name"] != "web_search");
@@ -1754,7 +2117,8 @@ mod tests {
         // the search and emit NO raw tool_use at all -> the caller derives end_turn.
         let tool_uses = vec![tu("web_search")];
         let searched = vec![fake_results("q")];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
+        let content =
+            build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
         assert!(!content.iter().any(|c| c["type"] == "tool_use"));
         assert!(
             content
@@ -1827,6 +2191,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn round_usage_prefers_provider_and_mixed_rounds_accumulate_each_category() {
+        let mut provider_round = round_outcome("ignored fallback output", vec![]);
+        provider_round.context_input_tokens = Some(999);
+        provider_round.provider_token_usage = Some(TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 5,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        });
+        let provider_usage = provider_round.resolved_token_usage(888);
+        assert_eq!(
+            provider_usage,
+            TokenUsage {
+                uncached_input_tokens: 3,
+                output_tokens: 5,
+                cache_read_input_tokens: 7,
+                cache_write_input_tokens: 4,
+            }
+        );
+
+        let mut fallback_round = round_outcome("fallback output", vec![]);
+        fallback_round.context_input_tokens = Some(20);
+        let fallback_usage = fallback_round.resolved_token_usage(500);
+        assert_eq!(fallback_usage.uncached_input_tokens, 20);
+        assert_eq!(fallback_usage.cache_write_input_tokens, 0);
+        assert_eq!(fallback_usage.cache_read_input_tokens, 0);
+        assert!(fallback_usage.output_tokens > 0);
+
+        let total = provider_usage.saturating_add(fallback_usage);
+        assert_eq!(total.uncached_input_tokens, 23);
+        assert_eq!(total.output_tokens, 5 + fallback_usage.output_tokens);
+        assert_eq!(total.cache_write_input_tokens, 4);
+        assert_eq!(total.cache_read_input_tokens, 7);
+    }
+
+    #[test]
+    fn aggregated_trace_usage_matches_websearch_usage_and_sanitizes_values() {
+        let trace = aggregated_trace_usage(
+            TokenUsage {
+                uncached_input_tokens: 3,
+                output_tokens: 5,
+                cache_read_input_tokens: 7,
+                cache_write_input_tokens: 4,
+            },
+            0.125,
+        );
+        assert_eq!(trace.input_tokens, 3);
+        assert_eq!(trace.output_tokens, 5);
+        assert_eq!(trace.cache_creation_tokens, 4);
+        assert_eq!(trace.cache_read_tokens, 7);
+        assert_eq!(trace.credits, 0.125);
+
+        let sanitized = aggregated_trace_usage(
+            TokenUsage {
+                uncached_input_tokens: -1,
+                output_tokens: -2,
+                cache_read_input_tokens: -3,
+                cache_write_input_tokens: -4,
+            },
+            f64::NAN,
+        );
+        assert_eq!(sanitized.input_tokens, 0);
+        assert_eq!(sanitized.output_tokens, 0);
+        assert_eq!(sanitized.cache_creation_tokens, 0);
+        assert_eq!(sanitized.cache_read_tokens, 0);
+        assert_eq!(sanitized.credits, 0.0);
+    }
+
+    #[test]
+    fn json_and_sse_render_the_same_four_part_usage() {
+        let expected = TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 5,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        };
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let response = render_json(
+            "claude-opus-4-7",
+            content.clone(),
+            "end_turn",
+            expected,
+            "",
+            None,
+        );
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+        });
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["usage"]["input_tokens"], json!(3));
+        assert_eq!(body["usage"]["output_tokens"], json!(5));
+        assert_eq!(body["usage"]["cache_creation_input_tokens"], json!(4));
+        assert_eq!(body["usage"]["cache_read_input_tokens"], json!(7));
+
+        let events = build_sse_events("claude-opus-4-7", content, "end_turn", expected, None);
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap()
+            .data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], json!(3));
+        assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
+        assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap()
+            .data["usage"];
+        assert_eq!(delta_usage["output_tokens"], json!(5));
+    }
+
     // ---- credit_usage 透传：run_web_search_loop 路径 ----
 
     fn metering_event(usage: f64) -> MeteringEvent {
@@ -1834,6 +2312,15 @@ mod tests {
             unit: "credit".to_string(),
             unit_plural: "credits".to_string(),
             usage,
+        }
+    }
+
+    fn token_usage(input_tokens: i32, output_tokens: i32) -> TokenUsage {
+        TokenUsage {
+            uncached_input_tokens: input_tokens,
+            output_tokens,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
         }
     }
 
@@ -1845,8 +2332,7 @@ mod tests {
             "claude-opus-4-7",
             content,
             "end_turn",
-            10,
-            5,
+            token_usage(10, 5),
             "",
             Some(&metering),
         );
@@ -1872,8 +2358,7 @@ mod tests {
             "claude-opus-4-7",
             content,
             "end_turn",
-            10,
-            5,
+            token_usage(10, 5),
             "",
             None,
         );
@@ -1896,8 +2381,7 @@ mod tests {
             "claude-opus-4-7",
             content,
             "end_turn",
-            10,
-            5,
+            token_usage(10, 5),
             Some(&metering),
         );
         let delta = events
@@ -1919,8 +2403,7 @@ mod tests {
             "claude-opus-4-7",
             content,
             "end_turn",
-            10,
-            5,
+            token_usage(10, 5),
             None,
         );
         let delta = events

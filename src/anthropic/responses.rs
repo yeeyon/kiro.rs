@@ -37,7 +37,7 @@ use axum::{
     Json,
     body::{Body, to_bytes},
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -48,8 +48,9 @@ use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
 use super::openai::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
+    resolve_session_metadata,
 };
-use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
+use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -126,6 +127,8 @@ pub struct ResponsesRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,10 +143,12 @@ pub struct ReasoningConfig {
 pub async fn post_responses(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
     let want_stream = req.stream;
     let model = req.model.clone();
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
 
     tracing::info!(
         model = %model,
@@ -152,7 +157,7 @@ pub async fn post_responses(
     );
 
     // 1. Responses -> Anthropic 请求翻译（同时得到工具声明类型表）
-    let (anthropic_req, tool_kinds) = match responses_to_anthropic(req) {
+    let (anthropic_req, tool_kinds) = match responses_to_anthropic(req, metadata) {
         Ok(r) => r,
         Err(msg) => {
             return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg);
@@ -215,6 +220,7 @@ pub async fn post_responses(
 
 fn responses_to_anthropic(
     req: ResponsesRequest,
+    metadata: Option<Metadata>,
 ) -> Result<(MessagesRequest, ToolKindMap), String> {
     let max_tokens = req
         .max_output_tokens
@@ -337,12 +343,16 @@ fn responses_to_anthropic(
             max_tokens,
             messages,
             stream: false,
-            system: if system.is_empty() { None } else { Some(system) },
+            system: if system.is_empty() {
+                None
+            } else {
+                Some(system)
+            },
             tools,
             tool_choice,
             thinking: None,
             output_config,
-            metadata: None,
+            metadata,
         },
         tool_kinds,
     ))
@@ -852,7 +862,7 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
 
     let mut usage = json!({
         "input_tokens": p.prompt_tokens,
-        "input_tokens_details": { "cached_tokens": 0 },
+        "input_tokens_details": { "cached_tokens": p.cached_tokens },
         "output_tokens": p.completion_tokens,
         "output_tokens_details": { "reasoning_tokens": 0 },
         "total_tokens": p.prompt_tokens + p.completion_tokens,
@@ -1168,6 +1178,54 @@ mod tests {
         json!([{ "type": "message", "role": "user", "content": "hi" }])
     }
 
+    #[test]
+    fn responses_body_session_metadata_is_forwarded() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "prompt_cache_key": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .unwrap();
+        let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &HeaderMap::new());
+        let (anthropic, _) = responses_to_anthropic(req, metadata).unwrap();
+
+        assert_eq!(
+            anthropic
+                .metadata
+                .and_then(|value| value.user_id)
+                .as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn responses_header_session_fallback_and_invalid_candidates_are_tolerated() {
+        let req = req_with(json!([]), simple_input());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-client-request-id",
+            "session_67e55044-10b1-426f-9247-bb680e5fe0c8"
+                .parse()
+                .unwrap(),
+        );
+        let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
+        let (anthropic, _) = responses_to_anthropic(req, metadata).unwrap();
+        assert_eq!(
+            anthropic
+                .metadata
+                .and_then(|value| value.user_id)
+                .as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+
+        let req = req_with(json!([]), simple_input());
+        headers.insert("x-client-request-id", "invalid".parse().unwrap());
+        let metadata = resolve_session_metadata(Some("also-invalid"), &headers);
+        assert!(metadata.is_none());
+        let (anthropic, _) = responses_to_anthropic(req, metadata).unwrap();
+        assert!(anthropic.metadata.is_none());
+    }
+
     fn parsed_with_tool_calls(tool_calls: Vec<Value>) -> ParsedResponse {
         ParsedResponse {
             model: "gpt-5.6-sol".to_string(),
@@ -1175,6 +1233,7 @@ mod tests {
             tool_calls,
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
+            cached_tokens: 0,
             completion_tokens: 5,
             web_searches: Vec::new(),
             credit_usage: None,
@@ -1221,9 +1280,15 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
-        assert_eq!(kinds.get("exec").map(|d| d.kind), Some(DeclaredToolKind::Custom));
-        assert_eq!(kinds.get("wait").map(|d| d.kind), Some(DeclaredToolKind::Function));
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
+        assert_eq!(
+            kinds.get("exec").map(|d| d.kind),
+            Some(DeclaredToolKind::Custom)
+        );
+        assert_eq!(
+            kinds.get("wait").map(|d| d.kind),
+            Some(DeclaredToolKind::Function)
+        );
         let tools = anth.tools.as_ref().unwrap();
         assert!(tools.iter().any(|t| t.name == "exec"));
         assert!(tools.iter().any(|t| t.name == "wait"));
@@ -1247,8 +1312,10 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
-        let decl = kinds.get("collaboration__spawn_agent").expect("flattened name");
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
+        let decl = kinds
+            .get("collaboration__spawn_agent")
+            .expect("flattened name");
         assert_eq!(decl.kind, DeclaredToolKind::Function);
         assert_eq!(decl.name, "spawn_agent");
         assert_eq!(decl.namespace.as_deref(), Some("collaboration"));
@@ -1286,7 +1353,7 @@ mod tests {
                 { "type": "function_call_output", "call_id": "c9", "output": "spawned" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
         let tu = &anth.messages[1].content.as_array().unwrap()[0];
         assert_eq!(tu["type"], "tool_use");
         assert_eq!(
@@ -1306,7 +1373,7 @@ mod tests {
             }]),
             simple_input(),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
         assert_eq!(
             kinds.get("apply_patch").map(|d| d.kind),
             Some(DeclaredToolKind::Custom)
@@ -1323,8 +1390,9 @@ mod tests {
         assert!(ap.description.contains("lark grammar"));
         assert!(ap.description.contains("start: PATCH"));
         // 原生 web_search 注入，noop 不再存在
-        assert!(tools.iter().any(|t| t.name == "web_search"
-            && t.tool_type.as_deref() == Some("web_search_20250305")));
+        assert!(tools.iter().any(
+            |t| t.name == "web_search" && t.tool_type.as_deref() == Some("web_search_20250305")
+        ));
         assert!(!tools.iter().any(|t| t.name == "noop"));
     }
 
@@ -1343,7 +1411,7 @@ mod tests {
             }]),
             simple_input(),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
         assert_eq!(
             kinds.get("shell").map(|d| d.kind),
             Some(DeclaredToolKind::Function)
@@ -1364,7 +1432,7 @@ mod tests {
     #[test]
     fn noop_fallback_when_no_codex_tools() {
         let req = req_with(json!([]), simple_input());
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
         assert!(kinds.is_empty());
         let tools = anth.tools.as_ref().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -1372,8 +1440,7 @@ mod tests {
         // 严格提示保留
         let sys = system_texts(&anth);
         assert!(
-            sys.iter()
-                .any(|t| t.contains("Do not call any other tool")),
+            sys.iter().any(|t| t.contains("Do not call any other tool")),
             "strict nudge must be kept for tool-less flows"
         );
     }
@@ -1384,7 +1451,7 @@ mod tests {
             json!([{ "type": "function", "name": "shell", "parameters": {} }]),
             simple_input(),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
         let sys = system_texts(&anth);
         assert!(
             !sys.iter().any(|t| t.contains("Do not call any other tool")),
@@ -1403,7 +1470,7 @@ mod tests {
             json!([{ "type": "function", "name": "web_search", "parameters": {} }]),
             simple_input(),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
         assert_eq!(
             kinds.get("web_search").map(|d| d.kind),
             Some(DeclaredToolKind::Function)
@@ -1426,7 +1493,7 @@ mod tests {
             ]),
             simple_input(),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
         let tools = anth.tools.unwrap();
         let ws: Vec<&Tool> = tools.iter().filter(|t| t.name == "web_search").collect();
         assert_eq!(ws.len(), 1);
@@ -1446,7 +1513,7 @@ mod tests {
                 { "type": "custom_tool_call_output", "call_id": "c1", "output": "Done!" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
         assert_eq!(anth.messages.len(), 3);
 
         let assistant = &anth.messages[1];
@@ -1481,7 +1548,7 @@ mod tests {
                   ] },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
         let tr = &anth.messages[2].content.as_array().unwrap()[0];
         assert_eq!(tr["content"], "line1\nline2");
     }
@@ -1496,7 +1563,7 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
         let sys = system_texts(&anth);
         assert!(
             sys.iter().any(|t| t.contains("AGENTS.md rules here")),
@@ -1518,7 +1585,7 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
         assert_eq!(anth.messages.len(), 1);
         assert_eq!(anth.messages[0].role, "user");
     }
@@ -1528,7 +1595,10 @@ mod tests {
     #[test]
     fn custom_input_unwrap_fallbacks() {
         // 标准：{"input": "..."}
-        assert_eq!(custom_input_text(r#"{"input":"*** Begin Patch"}"#), "*** Begin Patch");
+        assert_eq!(
+            custom_input_text(r#"{"input":"*** Begin Patch"}"#),
+            "*** Begin Patch"
+        );
         // 单字段字符串对象
         assert_eq!(custom_input_text(r#"{"cmd":"echo hi"}"#), "echo hi");
         // 多字段对象 → 原样
@@ -1648,18 +1718,22 @@ mod tests {
         );
         let input_done_line = sse
             .lines()
-            .find(|l| {
-                l.starts_with("data: ")
-                    && l.contains("response.custom_tool_call_input.done")
-            })
+            .find(|l| l.starts_with("data: ") && l.contains("response.custom_tool_call_input.done"))
             .expect("custom input done event data line");
         assert!(input_done_line.contains("\"input\":\"PATCH BODY\""));
         // added 也必须带完整 input（codex 反序列化要求字段存在）
         let added_line = sse
             .lines()
-            .find(|l| l.starts_with("data: ") && l.contains("custom_tool_call") && l.contains("in_progress"))
+            .find(|l| {
+                l.starts_with("data: ")
+                    && l.contains("custom_tool_call")
+                    && l.contains("in_progress")
+            })
             .expect("added event data line");
-        assert!(added_line.contains("PATCH BODY"), "added item carries full input");
+        assert!(
+            added_line.contains("PATCH BODY"),
+            "added item carries full input"
+        );
     }
 
     #[test]
@@ -1696,6 +1770,38 @@ mod tests {
         assert!(!sse.contains("Need wait"));
         assert!(sse.contains("\"text\":\"hi\""));
         assert!(sse.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn usage_maps_cached_subset_in_json_and_completed_sse() {
+        let anthropic = json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 5
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        let view = build_view(&p, &ToolKindMap::new());
+
+        assert_eq!(view.usage["input_tokens"], json!(14));
+        assert_eq!(
+            view.usage["input_tokens_details"]["cached_tokens"],
+            json!(7)
+        );
+        assert_eq!(view.usage["output_tokens"], json!(5));
+        assert_eq!(view.usage["total_tokens"], json!(19));
+
+        let sse = build_responses_sse(&p, &ToolKindMap::new());
+        let completed = sse
+            .lines()
+            .find(|line| line.starts_with("data: ") && line.contains("response.completed"))
+            .expect("response.completed data line");
+        let event: Value = serde_json::from_str(completed.trim_start_matches("data: ")).unwrap();
+        assert_eq!(event["response"]["usage"], view.usage);
     }
 
     // ---- credit_usage 透传 ----

@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.6] - 2026-08-13
+
+主题：**修复 GPT-5.6 推理参数、OpenAI 会话缓存与 Token 用量统计，同时校正 Claude Code 会话隔离和 Opus 5 上下文窗口识别**。本版聚焦协议转换与计量准确性，不新增配置项或迁移步骤。
+
+### 🔧 修复 — GPT-5.6 推理参数与 OpenAI 上游缓存
+
+> 来源：[PR #64](https://github.com/ZyphrZero/kiro.rs/pull/64)。提交人：[@kiim-wong](https://github.com/kiim-wong)，感谢贡献。
+
+- **按模型族生成正确的 effort 字段**：GPT-5.6 sol/terra/luna 现在通过 `additionalModelRequestFields.reasoning.effort` 传递 `none`、`low`、`medium`、`high`、`xhigh` 或 `max`；Claude 模型继续使用 `output_config.effort`。
+- **为 OpenAI 请求建立稳定的会话亲和**：Chat Completions 与 Responses 会依次从 `prompt_cache_key`、`x-session-affinity`、`x-client-request-id` 和 `session_id` 提取 UUID，并复用为 Kiro `conversationId`，使同一会话能够命中上游缓存。
+- **保持无状态请求的原有边界**：会话标识缺失或非法时仍生成随机 `conversationId`，不会把不同请求错误归入同一会话。
+
+### 📊 修复 — OpenAI Token 与缓存用量统计
+
+- **优先采用服务端精确计量**：解析 `metadataEvent.tokenUsage` 中的未缓存输入、缓存写入、缓存读取和输出 Token；服务端未提供时再依次回退到上下文用量与本地估算。
+- **修正 OpenAI Usage 映射**：`input_tokens` 现在包含未缓存输入、缓存写入和缓存读取；Responses API 的 `cached_tokens` 对应实际缓存读取量。
+- **统一流式请求的最终用量**：多轮 Web Search 会累加各轮计量，正常完成、错误和中断路径使用同一份最终用量快照。
+
+### 🔧 修复 — Claude Code 缓存计量的会话隔离
+
+> 来源：[PR #63](https://github.com/ZyphrZero/kiro.rs/pull/63)。提交人：[@childe](https://github.com/childe)，感谢贡献。
+
+- **支持 JSON 形态的 `user_id`**：缓存计量会从 Claude Code 当前发送的 JSON 元数据中提取 `session_id`，恢复共享系统密钥下的会话级缓存隔离。
+- **兼容旧格式**：JSON 解析失败时继续识别原有的 `..._session_<uuid>` 字符串，既有客户端无需迁移。
+- **避免并行会话相互干扰**：使用客户端密钥时，缓存作用域不再因 JSON 元数据无法识别而退化到密钥级别。
+
+### 🔧 修复 — Opus 5 的 1M 上下文窗口
+
+> 来源：[PR #61](https://github.com/ZyphrZero/kiro.rs/pull/61)。提交人：[@lijmyeah](https://github.com/lijmyeah)，感谢贡献。
+
+- **将 `claude-opus-5` 纳入 1M 模型族**：Opus 5 及其别名、带后缀模型名不再错误回退到 200K 上下文窗口。
+- **校正上下文进度与自动压缩时机**：Context Usage 换算基于正确的窗口大小，避免用量显示偏低以及上下文接近上限时未及时触发压缩。
+- **补充模型识别回归测试**：覆盖 Opus 5 的标准名、别名和后缀形式，并确保 Opus 4.5 不被误判为 1M 模型。
+
+### 🔒 兼容性
+
+- 无新增配置项、依赖或数据迁移。
+- 旧式 Claude Code 会话标识继续受支持；缺少合法会话标识的 OpenAI 请求继续使用随机会话 ID。
+
 ## [0.7.5] - 2026-08-05
 
 主题：**为多账号调度加入单账号 RPM 主动限流，并集中增强管理端的凭据筛选、批量操作、创建时间、请求计费与移动端可用性**。本版同时加固 WebSearch MCP 的查询参数兼容和 Enterprise / IdC 路由；新增配置默认关闭或带有 `serde(default)`，旧 `config.json` 与 `credentials.json` 无需迁移。

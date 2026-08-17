@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::{Event, MeteringEvent};
+use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 
 /// thinking 块的 signature 占位字符串
 ///
@@ -1367,6 +1367,8 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 上游 metadataEvent.tokenUsage 的精确最终快照。
+    pub provider_token_usage: Option<TokenUsage>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -1434,13 +1436,30 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
-    /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
+    /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
     ///
-    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
+    /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
+        if let Some(usage) = self.provider_token_usage {
+            let usage = usage.sanitized();
+            return (
+                usage.uncached_input_tokens,
+                usage.cache_write_input_tokens,
+                usage.cache_read_input_tokens,
+            );
+        }
+
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
         self.cache_usage.split_against_total(total_real)
+    }
+
+    /// 精确 provider 输出 token 优先，否则返回流内容的本地估算。
+    pub fn resolved_output_tokens(&self) -> i32 {
+        self.provider_token_usage
+            .map(|usage| usage.sanitized().output_tokens)
+            .unwrap_or(self.output_tokens)
+            .max(0)
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1463,6 +1482,7 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            provider_token_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -1563,6 +1583,22 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::Metadata(metadata) => {
+                if let Some(usage) = metadata.token_usage {
+                    let usage = usage.sanitized();
+                    tracing::debug!(
+                        uncached_input_tokens = usage.uncached_input_tokens,
+                        cache_write_input_tokens = usage.cache_write_input_tokens,
+                        cache_read_input_tokens = usage.cache_read_input_tokens,
+                        output_tokens = usage.output_tokens,
+                        "收到 metadataEvent.tokenUsage 精确用量"
+                    );
+                    // tokenUsage 是最终快照；同一 provider 流内重复出现时取最后一份，
+                    // 不能累加，否则会重复计费。
+                    self.provider_token_usage = Some(usage);
+                }
+                Vec::new()
+            }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
@@ -1851,18 +1887,24 @@ impl StreamContext {
                                 .as_ref()
                                 .map(|(n, _)| self.known_tool_names.contains(n))
                                 .unwrap_or(false);
-                            if invoke_looks_like_real_leak(before) && !fence_after_before && name_known {
+                            if invoke_looks_like_real_leak(before)
+                                && !fence_after_before
+                                && name_known
+                            {
                                 // 真泄漏：吐块前文本（剥掉尾部独立的 call/count 行）+ 合成 tool_use
                                 if !before.is_empty() {
                                     events.extend(self.emit_text_delta_raw(before));
                                 }
                                 // parsed 在上面已确认是 Some 且 name_known
-                                let (name, input_json) = parsed.expect("parsed is Some when name_known");
+                                let (name, input_json) =
+                                    parsed.expect("parsed is Some when name_known");
                                 // 解析完整入参 → 统一还原 → 统一发出（与结构化 toolUseEvent 同一发出口）。
                                 let input: serde_json::Value =
                                     serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
-                                let tool_use_id =
-                                    format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                                let tool_use_id = format!(
+                                    "toolu_{}",
+                                    Uuid::new_v4().to_string().replace('-', "")
+                                );
                                 let completed = CompletedToolUse::from_kiro(
                                     tool_use_id,
                                     &name,
@@ -2373,7 +2415,10 @@ impl StreamContext {
         // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
         // 发出完整的工具调用；半截 / 非法 JSON 记为错误，交由收尾（generate_final_events）
         // 统一补发 error 事件，避免把无法解析的参数当成完整调用转发给客户端。
-        let completed = match self.tool_json_accumulator.push(tool_use, &self.tool_name_map) {
+        let completed = match self
+            .tool_json_accumulator
+            .push(tool_use, &self.tool_name_map)
+        {
             Ok(Some(completed)) => completed,
             Ok(None) => return events,
             Err(e) => {
@@ -2501,13 +2546,14 @@ impl StreamContext {
             self.state_manager.set_stop_reason("error");
         }
 
-        // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
+        // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let final_output_tokens = self.resolved_output_tokens();
 
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
-            self.output_tokens,
+            final_output_tokens,
             cache_creation,
             cache_read,
             self.metering.as_ref(),
@@ -2639,7 +2685,7 @@ impl BufferedStreamContext {
         let (input, creation, read) = self.inner.resolved_usage();
         (
             input,
-            self.inner.output_tokens,
+            self.inner.resolved_output_tokens(),
             creation,
             read,
             self.inner.credits,
@@ -2733,7 +2779,10 @@ mod tests {
     fn tool_json_accumulator_invalid_json_errors() {
         let mut acc = ToolJsonAccumulator::new();
         let err = acc
-            .push(&tool_evt("t1", "read_file", "{not json", true), &HashMap::new())
+            .push(
+                &tool_evt("t1", "read_file", "{not json", true),
+                &HashMap::new(),
+            )
             .unwrap_err();
         assert_eq!(err.error_type(), "upstream_tool_json_error");
         assert!(matches!(err, ToolJsonAccumulatorError::InvalidJson { .. }));
@@ -2752,7 +2801,10 @@ mod tests {
             .is_none()
         );
         let err = acc.finish().unwrap_err();
-        assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { .. }));
+        assert!(matches!(
+            err,
+            ToolJsonAccumulatorError::IncompleteJson { .. }
+        ));
         // 已取出残留后再 finish() 应成功。
         assert!(acc.finish().is_ok());
     }
@@ -2801,8 +2853,7 @@ mod tests {
         let start = events
             .iter()
             .find(|e| {
-                e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "tool_use"
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
             })
             .expect("应有 tool_use content_block_start");
         assert_eq!(start.data["content_block"]["id"], block["id"]);
@@ -2813,7 +2864,10 @@ mod tests {
             .expect("应有 input_json_delta");
         let partial = delta.data["delta"]["partial_json"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(partial).unwrap();
-        assert_eq!(parsed, block["input"], "流式增量拼出的 input 应与非流式块一致");
+        assert_eq!(
+            parsed, block["input"],
+            "流式增量拼出的 input 应与非流式块一致"
+        );
         assert!(events.iter().any(|e| e.event == "content_block_stop"));
     }
 
@@ -2822,7 +2876,8 @@ mod tests {
     #[test]
     fn tool_use_xml_filter_strips_single_chunk_block() {
         let mut f = ToolUseXmlLeakFilter::default();
-        let out = f.filter("before <tool_use id=\"t\" name=\"Write\">{\"path\":\"/a\"}</tool_use> after")
+        let out = f
+            .filter("before <tool_use id=\"t\" name=\"Write\">{\"path\":\"/a\"}</tool_use> after")
             + &f.finish();
         assert!(!out.contains("<tool_use"));
         assert!(out.contains("before") && out.contains("after"));
@@ -2847,7 +2902,10 @@ mod tests {
         out.push_str(&f.filter("_use>y"));
         out.push_str(&f.finish());
         assert!(!out.contains("<tool_use"), "out={out:?}");
-        assert!(out.contains('x') && out.contains('y'), "闭合跨 chunk 时其后文本不应被吞: {out:?}");
+        assert!(
+            out.contains('x') && out.contains('y'),
+            "闭合跨 chunk 时其后文本不应被吞: {out:?}"
+        );
     }
 
     #[test]
@@ -2891,10 +2949,17 @@ mod tests {
     /// 测试用的「已知工具表」：包含 invoke 测试里会合成的工具名，
     /// 让 🅳 工具表校验放行这些名字，从而能验证捞回逻辑本身。
     fn test_known_tools() -> std::collections::HashSet<String> {
-        ["exec_command", "apply_patch", "tool_a", "tool_b", "write_file", "wait_agent"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "exec_command",
+            "apply_patch",
+            "tool_a",
+            "tool_b",
+            "write_file",
+            "wait_agent",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     // ---- extract_invoke_content_blocks: one-shot (non-streaming) reclamation ----
@@ -2915,11 +2980,16 @@ mod tests {
         assert_eq!(tu["input"]["cmd"], "echo hi");
         assert!(
             !blocks.iter().any(|b| b["type"] == "text"
-                && b["text"].as_str().map(|t| t.contains("<invoke")).unwrap_or(false)),
+                && b["text"]
+                    .as_str()
+                    .map(|t| t.contains("<invoke"))
+                    .unwrap_or(false)),
             "no literal <invoke> may remain as text"
         );
         assert!(
-            !blocks.iter().any(|b| b["type"] == "text" && b["text"] == "call\n"),
+            !blocks
+                .iter()
+                .any(|b| b["type"] == "text" && b["text"] == "call\n"),
             "stray token line must be stripped"
         );
     }
@@ -2937,20 +3007,40 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(short.to_string(), original.to_string());
         let blocks = extract_invoke_content_blocks(&text, &known, &map);
-        let tu = blocks.iter().find(|b| b["type"] == "tool_use").expect("reclaimed");
-        assert_eq!(tu["name"], original, "shortened name must be restored to original");
+        let tu = blocks
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("reclaimed");
+        assert_eq!(
+            tu["name"], original,
+            "shortened name must be restored to original"
+        );
     }
 
     #[test]
     fn extract_blocks_does_not_reclaim_fenced_or_unknown() {
         // fenced -> display, not reclaimed
         let fenced = "see:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
-        let b1 = extract_invoke_content_blocks(fenced, &test_known_tools(), &std::collections::HashMap::new());
-        assert!(!b1.iter().any(|b| b["type"] == "tool_use"), "fenced must not reclaim");
+        let b1 = extract_invoke_content_blocks(
+            fenced,
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            !b1.iter().any(|b| b["type"] == "tool_use"),
+            "fenced must not reclaim"
+        );
         // unknown tool name -> not reclaimed
         let unknown = "call\n<invoke name=\"not_a_real_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
-        let b2 = extract_invoke_content_blocks(unknown, &test_known_tools(), &std::collections::HashMap::new());
-        assert!(!b2.iter().any(|b| b["type"] == "tool_use"), "unknown name must not reclaim");
+        let b2 = extract_invoke_content_blocks(
+            unknown,
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            !b2.iter().any(|b| b["type"] == "tool_use"),
+            "unknown name must not reclaim"
+        );
     }
 
     #[test]
@@ -3019,7 +3109,8 @@ mod tests {
             "mcp__very_long_original_tool_name".to_string(),
         );
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map, test_known_tools());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, map, test_known_tools());
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -3045,7 +3136,13 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -3106,7 +3203,13 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -3313,7 +3416,13 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -3368,7 +3477,13 @@ mod tests {
         // 客户端在 thinking 模式下要求 thinking 块带 signature 字段，否则下一轮回传时
         // 会抛出 "must be passed back to the API"。本测试验证 thinking 块结束前发送了
         // 一个非空的 signature_delta 事件。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3402,7 +3517,13 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -3422,7 +3543,13 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -3451,7 +3578,13 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -3483,7 +3616,13 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -3512,7 +3651,13 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
@@ -3589,7 +3734,13 @@ mod tests {
     #[test]
     fn test_invoke_sniff_backtick_wrapped_is_not_captured() {
         // 🔴 防误伤：被反引号包裹的 <invoke> 是引用，不应被抓
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3610,7 +3761,13 @@ mod tests {
     #[test]
     fn test_invoke_sniff_single_bare_invoke() {
         // 🟢 单个裸 invoke（无外壳）
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3630,7 +3787,13 @@ mod tests {
     #[test]
     fn test_invoke_sniff_param_value_with_lt_multiline_chinese() {
         // 🟢 参数值含 `<`、多行、中文 → 不被截断
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let value = "第一行 a < b\n第二行 路径 /tmp/中文";
@@ -3655,7 +3818,13 @@ mod tests {
     #[test]
     fn test_invoke_sniff_two_invokes_sequential() {
         // 🟢 2 个 invoke 串联 → 2 个 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3673,7 +3842,13 @@ mod tests {
     #[test]
     fn test_invoke_sniff_split_across_chunks() {
         // 🟢 跨 chunk 分片：标签被切碎多次喂入
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3694,7 +3869,13 @@ mod tests {
     #[test]
     fn test_invoke_sniff_strips_stray_call_token() {
         // 🟢 stray token：<invoke> 前有单独一行 `call` → 剥掉，text 不含残留 call
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3736,8 +3917,13 @@ mod tests {
     fn test_invoke_sniff_reclaims_after_narrative_then_stray_token() {
         // 端到端：`正文\ncall\n<invoke...>` —— 正文 + stray token + 真泄漏 invoke。
         // 旧实现漏捞（stray 剥过头把正文和 invoke 挤一行），修后应成功捞回 tool_use。
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3747,16 +3933,31 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let tools = collect_tool_uses(&all);
-        assert_eq!(tools.len(), 1, "narrative+stray+invoke 应捞回 1 个 tool_use: {:?}", tools);
+        assert_eq!(
+            tools.len(),
+            1,
+            "narrative+stray+invoke 应捞回 1 个 tool_use: {:?}",
+            tools
+        );
         let text = collect_text_content(&all);
         assert!(text.contains("先看看结果"), "叙述正文应保留: {:?}", text);
-        assert!(!text.contains("call\n<invoke") && !text.contains("<invoke"), "invoke 不应泄漏为文本: {:?}", text);
+        assert!(
+            !text.contains("call\n<invoke") && !text.contains("<invoke"),
+            "invoke 不应泄漏为文本: {:?}",
+            text
+        );
     }
 
     #[test]
     fn test_invoke_sniff_keeps_narrative_before_invoke() {
         // 🟢 invoke 前有叙述：text 含"先看看"，1 个 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3779,7 +3980,13 @@ mod tests {
     #[test]
     fn test_invoke_sniff_truncated_block_not_captured() {
         // 🔴 截断半块（无 </invoke> 闭合）→ 0 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3795,7 +4002,13 @@ mod tests {
     #[test]
     fn test_invoke_midsentence_not_captured() {
         // 🔴 P1：正文里嵌在句子中间（无反引号、非行首）的 <invoke> 是讨论文本，不应被抓
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -3827,7 +4040,13 @@ mod tests {
     #[test]
     fn test_invoke_midsentence_unclosed_not_hold() {
         // 🔴 P2：流式中途遇到句中不闭合的 <invoke，不应 hold 住后续文本到流末尾
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         // 第一次 process：句中不闭合的 <invoke>，前面同一行有正文“讨论”
@@ -3862,7 +4081,13 @@ mod tests {
     fn test_invoke_multiline_patch_split_still_captured() {
         // 🟢 P3：行首合法 invoke，参数值是 20+ 行多行文本（模拟 apply_patch），
         // 逐行流式喂入。修复前换行数 ≥16 会被 too_long 误杀降级成文本；修复后应抓到。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         // 构造一个 24 行的多行 patch 内容
@@ -3915,7 +4140,13 @@ mod tests {
     #[test]
     fn test_invoke_large_patch_split_captured() {
         // 🟢 P3：参数值 ~17KB 多行，分片喂入，断言抓到 1 个 tool_use（在 256KB 上限之下）。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         // 每行 ~70 字节 × 250 行 ≈ 17KB
@@ -3965,7 +4196,13 @@ mod tests {
     fn test_unclosed_invoke_eventually_flushed_as_text() {
         // 🟢 锁定字节兜底仍在：行首 `<invoke>` 永不闭合、喂入超过 MAX_INVOKE_HOLD_BYTES，
         // 应被当文本吐出（不无限 hold）。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         // 行首开标签，永不闭合；填充超过上限的纯文本（无 </invoke>）
@@ -3997,7 +4234,13 @@ mod tests {
     #[test]
     fn test_invoke_in_markdown_list_not_captured() {
         // 🔴 markdown 列表项 `- <invoke>` 当讨论文本，不抓。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4023,7 +4266,13 @@ mod tests {
     #[test]
     fn test_invoke_in_blockquote_not_captured() {
         // 🔴 引用 `> <invoke>` 当讨论文本，不抓。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4062,7 +4311,9 @@ mod tests {
     fn block_stop_position(events: &[SseEvent], index: i64) -> usize {
         events
             .iter()
-            .position(|e| e.event == "content_block_stop" && e.data["index"].as_i64() == Some(index))
+            .position(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(index)
+            })
             .unwrap_or_else(|| panic!("block {index} should stop"))
     }
 
@@ -4070,7 +4321,13 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4093,7 +4350,13 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4115,7 +4378,13 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4139,7 +4408,13 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4172,7 +4447,13 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -4227,7 +4508,13 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -4248,7 +4535,13 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -4279,8 +4572,13 @@ mod tests {
     /// 🅿️ P0-1：参数值里含字面 `</invoke>`，块不应被假闭合截断，input 要完整。
     #[test]
     fn test_invoke_param_value_contains_literal_invoke_close() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         // patch 正文里出现字面 </invoke>，真正的闭合在最后
         let payload = "count\n<invoke name=\"apply_patch\"><parameter name=\"input\">line1\n</invoke>\nstill in patch\nline3</parameter></invoke>";
@@ -4292,17 +4590,28 @@ mod tests {
         assert_eq!(tools[0].0, "apply_patch");
         let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
         let input = parsed["input"].as_str().expect("有 input");
-        assert!(input.contains("still in patch"), "input 不应被假闭合截断: {input:?}");
+        assert!(
+            input.contains("still in patch"),
+            "input 不应被假闭合截断: {input:?}"
+        );
         assert!(input.contains("line3"), "input 应含 line3: {input:?}");
         let text = collect_text_content(&all);
-        assert!(!text.contains("still in patch"), "patch 正文不应泄漏到 text: {text:?}");
+        assert!(
+            !text.contains("still in patch"),
+            "patch 正文不应泄漏到 text: {text:?}"
+        );
     }
 
     /// 🅿️ P0-1：参数值里含字面 `</parameter>`，值不应被截断丢失后半段。
     #[test]
     fn test_invoke_param_value_contains_literal_parameter_close() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"apply_patch\"><parameter name=\"input\">before</parameter> after the fake close</parameter></invoke>";
         let mut all = Vec::new();
@@ -4312,14 +4621,22 @@ mod tests {
         assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
         let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
         let input = parsed["input"].as_str().expect("有 input");
-        assert!(input.contains("after the fake close"), "后半段不应丢: {input:?}");
+        assert!(
+            input.contains("after the fake close"),
+            "后半段不应丢: {input:?}"
+        );
     }
 
     /// 🅱：代码围栏（```）内的 <invoke> 是正文展示，不应被捞回成 tool_use。
     #[test]
     fn test_invoke_inside_code_fence_not_captured() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let payload = "示例代码：\n```\n<invoke name=\"exec_command\"><parameter name=\"cmd\">rm -rf /</parameter></invoke>\n```\n讲解完毕。";
         let mut all = Vec::new();
@@ -4328,15 +4645,23 @@ mod tests {
         let tools = collect_tool_uses(&all);
         assert!(tools.is_empty(), "围栏内展示文本不应被捞回: {:?}", tools);
         let text = collect_text_content(&all);
-        assert!(text.contains("<invoke name=\"exec_command\">"), "应原样保留: {text:?}");
+        assert!(
+            text.contains("<invoke name=\"exec_command\">"),
+            "应原样保留: {text:?}"
+        );
     }
 
     /// 🅳：合成出的工具名不在已知工具表里 → 不捞回，当文本吐出（防误执行）。
     #[test]
     fn test_invoke_unknown_tool_name_not_synthesized() {
         // 已知工具表里没有 totally_unknown_tool
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"totally_unknown_tool\"><parameter name=\"x\">1</parameter></invoke>";
         let mut all = Vec::new();
@@ -4345,7 +4670,10 @@ mod tests {
         let tools = collect_tool_uses(&all);
         assert!(tools.is_empty(), "未知工具名不应被合成: {:?}", tools);
         let text = collect_text_content(&all);
-        assert!(text.contains("totally_unknown_tool"), "未知工具应原样当文本: {text:?}");
+        assert!(
+            text.contains("totally_unknown_tool"),
+            "未知工具应原样当文本: {text:?}"
+        );
     }
 
     /// 🅳：已知工具表为空（请求没带 tools）→ 一律不捞回，宁可漏捞不可误执行。
@@ -4359,7 +4687,8 @@ mod tests {
             std::collections::HashSet::new(),
         );
         let _ = ctx.generate_initial_events();
-        let payload = "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
+        let payload =
+            "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response(payload));
         all.extend(ctx.generate_final_events());
@@ -4370,8 +4699,13 @@ mod tests {
     /// 🅲：stray token `card` 也应被剥掉，块仍被捞回。
     #[test]
     fn test_invoke_strips_stray_card_token() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let payload = "我先等结果。\n\ncard\n<invoke name=\"wait_agent\"><parameter name=\"x\">1</parameter></invoke>";
         let mut all = Vec::new();
@@ -4381,20 +4715,30 @@ mod tests {
         assert_eq!(tools.len(), 1, "card 前缀的块应被捞回: {:?}", tools);
         assert_eq!(tools[0].0, "wait_agent");
         let text = collect_text_content(&all);
-        assert!(!text.contains("card"), "card stray token 不应泄漏: {text:?}");
+        assert!(
+            !text.contains("card"),
+            "card stray token 不应泄漏: {text:?}"
+        );
         assert!(text.contains("我先等结果"), "正常叙述应保留: {text:?}");
     }
 
     /// 🅱 跨 chunk：``` 围栏开标签在 chunk 边界被切碎，仍能正确识别围栏内不捞回。
     #[test]
     fn test_invoke_fence_split_across_chunks() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let mut all = Vec::new();
         // 围栏开标签分两个 chunk 到达
         all.extend(ctx.process_assistant_response("看代码：\n``"));
-        all.extend(ctx.process_assistant_response("`\n<invoke name=\"exec_command\"><parameter name=\"cmd\">x</parameter></invoke>\n```"));
+        all.extend(ctx.process_assistant_response(
+            "`\n<invoke name=\"exec_command\"><parameter name=\"cmd\">x</parameter></invoke>\n```",
+        ));
         all.extend(ctx.generate_final_events());
         let tools = collect_tool_uses(&all);
         assert!(tools.is_empty(), "跨 chunk 围栏内不应捞回: {:?}", tools);
@@ -4404,15 +4748,25 @@ mod tests {
     /// 不应把 A、B 误合并成一个块、也不应让 B 的参数串进 A。两个块都应独立捞回。
     #[test]
     fn test_invoke_burst_with_trailing_text_not_merged() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter>trailing plain</invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>";
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response(payload));
         all.extend(ctx.generate_final_events());
         let tools = collect_tool_uses(&all);
-        assert_eq!(tools.len(), 2, "应独立合成 2 个 tool_use，不能误合并: {:?}", tools);
+        assert_eq!(
+            tools.len(),
+            2,
+            "应独立合成 2 个 tool_use，不能误合并: {:?}",
+            tools
+        );
         assert_eq!(tools[0].0, "tool_a");
         assert_eq!(tools[1].0, "tool_b");
         let a: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
@@ -4425,8 +4779,13 @@ mod tests {
     /// 🟢 正常连发 burst（块紧贴、A 以 </parameter> 收尾）仍应正确拆成两个。
     #[test]
     fn test_invoke_burst_clean_two_blocks() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter></invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>";
         let mut all = Vec::new();
@@ -4444,7 +4803,10 @@ mod tests {
     #[test]
     fn test_invoke_real_leak_sample_from_thread_019e9e8d() {
         let known: std::collections::HashSet<String> =
-            ["exec_command", "update_plan", "update_goal"].iter().map(|s| s.to_string()).collect();
+            ["exec_command", "update_plan", "update_goal"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), known);
         let _ = ctx.generate_initial_events();
@@ -4454,24 +4816,34 @@ mod tests {
         all.extend(ctx.process_assistant_response(real));
         all.extend(ctx.generate_final_events());
         let tools = collect_tool_uses(&all);
-        assert_eq!(tools.len(), 1, "真实泄漏样本应被捞回成 1 个 tool_use: {:?}", tools);
+        assert_eq!(
+            tools.len(),
+            1,
+            "真实泄漏样本应被捞回成 1 个 tool_use: {:?}",
+            tools
+        );
         assert_eq!(tools[0].0, "exec_command", "name 应为 exec_command");
         let parsed: serde_json::Value =
             serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
         assert!(
             parsed["cmd"].as_str().unwrap_or("").contains("pytest"),
-            "cmd 参数应完整保留: {:?}", parsed
+            "cmd 参数应完整保留: {:?}",
+            parsed
         );
         assert_eq!(parsed["yield_time_ms"], "60000", "yield_time_ms 参数应保留");
         // 关键：字面 <invoke> 不应泄漏到 text
         let text = collect_text_content(&all);
         assert!(
             !text.contains("<invoke name=\"exec_command\">"),
-            "字面 <invoke> 不应泄漏到文本: {:?}", text
+            "字面 <invoke> 不应泄漏到文本: {:?}",
+            text
         );
         // count stray token 也不应泄漏
-        assert!(!text.contains("\ncount\n") && !text.ends_with("count"),
-            "count stray token 不应泄漏: {:?}", text);
+        assert!(
+            !text.contains("\ncount\n") && !text.ends_with("count"),
+            "count stray token 不应泄漏: {:?}",
+            text
+        );
     }
 
     // ---- 复读熔断 (repeat guard)：root cause = Opus 长上下文退化复读 ----
@@ -4480,8 +4852,13 @@ mod tests {
     /// 熔断后吐出的 count 数必须远小于喂入的数量，且不撑满输出。
     #[test]
     fn repeat_guard_trips_on_count_flood() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
 
         // 真实形态：正常话 + call + 海量 count（这里用 5000 次模拟 3.2 万次）
@@ -4511,8 +4888,13 @@ mod tests {
     /// 🟢 不误伤：正常工具调用前的 1 个引导词 `count` + 真 <invoke> 仍被正常捞回。
     #[test]
     fn repeat_guard_does_not_trip_on_single_stray_token() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let payload =
             "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
@@ -4520,30 +4902,54 @@ mod tests {
         all.extend(ctx.process_assistant_response(payload));
         all.extend(ctx.generate_final_events());
         let tools = collect_tool_uses(&all);
-        assert_eq!(tools.len(), 1, "单个引导词不应触发熔断，invoke 应正常捞回: {:?}", tools);
+        assert_eq!(
+            tools.len(),
+            1,
+            "单个引导词不应触发熔断，invoke 应正常捞回: {:?}",
+            tools
+        );
         assert_eq!(tools[0].0, "exec_command");
     }
 
     /// 🟢 不误伤：正常多行文本里偶尔出现 count 单词（非独占行复读）不熔断。
     #[test]
     fn repeat_guard_does_not_trip_on_normal_prose() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
-        let payload = "我数了一下 count = 3，然后继续做别的事。\n这是第二行正常文字。\n第三行也正常。";
+        let payload =
+            "我数了一下 count = 3，然后继续做别的事。\n这是第二行正常文字。\n第三行也正常。";
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response(payload));
         all.extend(ctx.generate_final_events());
         let text = collect_text_content(&all);
-        assert!(text.contains("我数了一下"), "正常正文不应被熔断: {:?}", text);
-        assert!(text.contains("第三行也正常"), "正常正文应完整保留: {:?}", text);
+        assert!(
+            text.contains("我数了一下"),
+            "正常正文不应被熔断: {:?}",
+            text
+        );
+        assert!(
+            text.contains("第三行也正常"),
+            "正常正文应完整保留: {:?}",
+            text
+        );
     }
 
     /// 🟢 跨 chunk 复读也能熔断（流式分片到达，每片一个 count）。
     #[test]
     fn repeat_guard_trips_across_chunks() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
         let _ = ctx.generate_initial_events();
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response("call\n\n"));
@@ -4581,7 +4987,11 @@ mod tests {
             .collect();
         let emitted = joined.matches("count").count();
         assert!(emitted < 64, "块级路径应折叠 count 洪水：实际={}", emitted);
-        assert!(joined.contains("先看 crawlee 状态"), "正常正文应保留: {:?}", &joined[..joined.len().min(60)]);
+        assert!(
+            joined.contains("先看 crawlee 状态"),
+            "正常正文应保留: {:?}",
+            &joined[..joined.len().min(60)]
+        );
     }
 
     /// 🟢 块级不误伤：单个引导词 count + 真 invoke 仍被捞回。
@@ -4594,7 +5004,9 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         assert!(
-            blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == "exec_command"),
+            blocks
+                .iter()
+                .any(|b| b["type"] == "tool_use" && b["name"] == "exec_command"),
             "单个引导词不应触发折叠，invoke 应捞回: {:?}",
             blocks
         );
@@ -4602,7 +5014,13 @@ mod tests {
 
     #[test]
     fn test_native_reasoning_event_emits_thinking_with_signature() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), std::collections::HashSet::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
         let mut all_events = ctx.generate_initial_events();
 
         all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
@@ -4626,7 +5044,13 @@ mod tests {
 
     #[test]
     fn test_native_reasoning_signature_only_applies_to_next_thinking_text() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), std::collections::HashSet::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
         let mut all_events = ctx.generate_initial_events();
 
         all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
@@ -4645,7 +5069,10 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(collect_thinking_content(&all_events), "delayed native reasoning");
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "delayed native reasoning"
+        );
         assert!(all_events.iter().any(|e| {
             e.event == "content_block_delta"
                 && e.data["delta"]["type"] == "signature_delta"
@@ -4655,7 +5082,13 @@ mod tests {
 
     #[test]
     fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), std::collections::HashSet::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
         let mut all_events = ctx.generate_initial_events();
 
         all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
@@ -4667,7 +5100,10 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(collect_text_content(&all_events), "visible reasoning fallback");
+        assert_eq!(
+            collect_text_content(&all_events),
+            "visible reasoning fallback"
+        );
         assert_eq!(collect_thinking_content(&all_events), "");
         assert!(!all_events.iter().any(|e| {
             e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
@@ -4680,7 +5116,13 @@ mod tests {
 
     #[test]
     fn test_native_redacted_thinking_is_ordered_between_thinking_and_text() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), std::collections::HashSet::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
         let mut all_events = ctx.generate_initial_events();
 
         all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
@@ -4721,7 +5163,13 @@ mod tests {
 
     #[test]
     fn test_native_reasoning_event_emits_redacted_thinking() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), std::collections::HashSet::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
         let mut all_events = ctx.generate_initial_events();
 
         all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
@@ -4783,9 +5231,7 @@ mod tests {
     #[test]
     fn test_generate_final_events_carries_credit_fields_when_metering_present() {
         let mut manager = SseStateManager::new();
-        let metering = parse_metering(
-            r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#,
-        );
+        let metering = parse_metering(r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#);
         let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering));
         let delta = events
             .iter()
@@ -4858,5 +5304,111 @@ mod tests {
         assert!(usage.get("credit_usage").is_none());
         assert!(usage.get("credit_unit").is_none());
         assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    #[test]
+    fn provider_usage_overrides_fallback_and_keeps_the_latest_snapshot() {
+        use crate::anthropic::cache_metering::CacheUsage;
+        use crate::kiro::model::events::MetadataEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.context_input_tokens = Some(80);
+        ctx.output_tokens = 99;
+        ctx.cache_usage = CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(TokenUsage {
+                uncached_input_tokens: 3,
+                output_tokens: 11,
+                cache_read_input_tokens: 7,
+                cache_write_input_tokens: 4,
+            }),
+        }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        assert_eq!(ctx.resolved_usage(), (3, 4, 7));
+        assert_eq!(ctx.resolved_output_tokens(), 11);
+
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(TokenUsage {
+                uncached_input_tokens: -1,
+                output_tokens: 22,
+                cache_read_input_tokens: 23,
+                cache_write_input_tokens: 24,
+            }),
+        }));
+        assert_eq!(ctx.resolved_usage(), (0, 24, 23));
+        assert_eq!(ctx.resolved_output_tokens(), 22);
+    }
+
+    #[test]
+    fn stream_usage_falls_back_to_context_cache_split_and_local_output() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.context_input_tokens = Some(80);
+        ctx.output_tokens = 9;
+        ctx.cache_usage = CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+
+        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
+        assert_eq!(ctx.resolved_output_tokens(), 9);
+    }
+
+    #[test]
+    fn buffered_stream_reports_the_same_provider_usage_in_events_and_final_usage() {
+        use crate::kiro::model::events::MetadataEvent;
+
+        let usage = TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 11,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        };
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
+            token_usage: Some(usage),
+        }));
+        let events = ctx.finish_and_get_all_events();
+
+        assert_eq!(ctx.final_usage(), (3, 11, 4, 7, 0.0));
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap()
+            .data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], json!(3));
+        assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
+        assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap()
+            .data["usage"];
+        assert_eq!(delta_usage["output_tokens"], json!(11));
     }
 }
