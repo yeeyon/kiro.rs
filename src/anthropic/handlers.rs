@@ -10,7 +10,7 @@ use crate::admin::trace_db::{
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::ModelDiscoveryError;
@@ -180,6 +180,9 @@ impl RequestTracer {
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
+        if !self.is_stream {
+            return;
+        }
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
@@ -230,14 +233,19 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
-    fn on_attempt(&self, attempt: TraceAttempt) {
-        self.attempts.lock().push(attempt);
+    fn on_attempt(&self, mut attempt: TraceAttempt) {
+        let mut attempts = self.attempts.lock();
+        // Each provider call numbers retries from zero. A web-search request can make
+        // several provider calls under one trace, so assign a request-wide sequence
+        // before persisting to the (trace_id, attempt) primary key.
+        attempt.attempt = attempts.len() as u32;
+        attempts.push(attempt);
     }
 }
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(crate) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(canonical_attempt_outcome(&last))
 }
@@ -400,12 +408,35 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// 计算 Anthropic usage 口径的 input_tokens
-fn resolve_usage_input_tokens(
+/// 解析普通非流式响应的最终 Anthropic usage。
+///
+/// 返回 `(uncached_input, output, cache_write, cache_read)`。精确 provider 快照优先；
+/// 缺失时才使用 contextUsage/输入估算和本地 CacheMeter 分摊。
+fn resolve_non_stream_usage(
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
-) -> i32 {
-    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+    fallback_output_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+    provider_usage: Option<TokenUsage>,
+) -> (i32, i32, i32, i32) {
+    if let Some(usage) = provider_usage {
+        let usage = usage.sanitized();
+        return (
+            usage.uncached_input_tokens,
+            usage.output_tokens,
+            usage.cache_write_input_tokens,
+            usage.cache_read_input_tokens,
+        );
+    }
+
+    let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
+    let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
+    (
+        input,
+        fallback_output_tokens.max(0),
+        cache_write,
+        cache_read,
+    )
 }
 
 fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
@@ -670,10 +701,19 @@ pub async fn post_messages(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -1020,7 +1060,7 @@ fn record_stream_usage(
     hook.record(
         credential_id,
         input,
-        ctx.output_tokens,
+        ctx.resolved_output_tokens(),
         cache_creation,
         cache_read,
         ctx.credits,
@@ -1033,7 +1073,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
     TraceUsage {
         input_tokens: input.max(0) as u64,
-        output_tokens: ctx.output_tokens.max(0) as u64,
+        output_tokens: ctx.resolved_output_tokens() as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
@@ -1123,6 +1163,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // metadataEvent.tokenUsage 是本次 provider 调用的精确最终快照。
+    let mut provider_token_usage: Option<TokenUsage> = None;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
@@ -1172,6 +1214,20 @@ async fn handle_non_stream_request(
                                     tracing::error!("{}", e);
                                     tool_json_error = Some(e);
                                 }
+                            }
+                        }
+                        Event::Metadata(metadata) => {
+                            if let Some(usage) = metadata.token_usage {
+                                let usage = usage.sanitized();
+                                tracing::debug!(
+                                    uncached_input_tokens = usage.uncached_input_tokens,
+                                    cache_write_input_tokens = usage.cache_write_input_tokens,
+                                    cache_read_input_tokens = usage.cache_read_input_tokens,
+                                    output_tokens = usage.output_tokens,
+                                    "收到 metadataEvent.tokenUsage 精确用量"
+                                );
+                                // 单条 provider 流内是最终快照，重复事件取最后一份。
+                                provider_token_usage = Some(usage);
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -1230,14 +1286,46 @@ async fn handle_non_stream_request(
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
     if let Some(err) = tool_json_error {
         let message = err.message();
-        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-        tracer.finalize(
-            "error",
-            Some(outcome::BAD_REQUEST),
-            Some(&message),
-            None,
-            TraceUsage::zero(),
-        );
+        if let Some(usage) = provider_token_usage {
+            let usage = usage.sanitized();
+            let trace_usage = TraceUsage {
+                input_tokens: usage.uncached_input_tokens as u64,
+                output_tokens: usage.output_tokens as u64,
+                cache_creation_tokens: usage.cache_write_input_tokens as u64,
+                cache_read_tokens: usage.cache_read_input_tokens as u64,
+                credits: if credits.is_finite() && credits > 0.0 {
+                    credits
+                } else {
+                    0.0
+                },
+            };
+            hook.record(
+                credential_id,
+                usage.uncached_input_tokens,
+                usage.output_tokens,
+                usage.cache_write_input_tokens,
+                usage.cache_read_input_tokens,
+                credits,
+                "error",
+            );
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(&message),
+                None,
+                trace_usage,
+            );
+        } else {
+            // metadata 缺失时保留原有错误口径，不把不完整工具输出估算成已消费量。
+            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(&message),
+                None,
+                TraceUsage::zero(),
+            );
+        }
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new("upstream_tool_json_error", message)),
@@ -1264,14 +1352,16 @@ async fn handle_non_stream_request(
     );
     content.extend(tool_uses);
 
-    // 估算输出 tokens（上游不下发 token，全部走估算）
-    let output_tokens = token::estimate_output_tokens(&content);
-
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：input + cache_creation + cache_read == total
-    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+    // provider 未下发 metadataEvent 时才使用本地输出估算。
+    let fallback_output_tokens = token::estimate_output_tokens(&content);
+    let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
+        resolve_non_stream_usage(
+            input_tokens,
+            context_input_tokens,
+            fallback_output_tokens,
+            cache_usage,
+            provider_token_usage,
+        );
 
     // 构建 Anthropic 响应
     let mut usage_json = json!({
@@ -1532,10 +1622,19 @@ pub async fn post_messages_cc(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -1876,6 +1975,154 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tracer_renumbers_attempts_across_provider_rounds_before_persisting() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "gpt-websearch-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 7,
+            key_source: TraceKeySource::ClientKey,
+            model: "gpt-5.6-luna".to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
+            attempt,
+            credential_id,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome.to_string(),
+            error_snippet: None,
+            duration_ms: 10,
+        };
+
+        // First provider round reports local attempts 0,1; the next round starts at 0 again.
+        tracer.on_attempt(attempt(0, 11, outcome::TRANSIENT));
+        tracer.on_attempt(attempt(1, 12, outcome::SUCCESS));
+        tracer.on_attempt(attempt(0, 13, outcome::SUCCESS));
+        tracer.finalize(
+            "success",
+            None,
+            None,
+            None,
+            TraceUsage {
+                input_tokens: 101,
+                output_tokens: 23,
+                cache_creation_tokens: 7,
+                cache_read_tokens: 89,
+                credits: 0.25,
+            },
+        );
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            model: Some("gpt-5.6-luna".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.final_credential_id, 13);
+        assert_eq!(record.total_attempts, 3);
+        assert_eq!(
+            record
+                .attempts
+                .iter()
+                .map(|a| a.attempt)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(record.input_tokens, 101);
+        assert_eq!(record.output_tokens, 23);
+        assert_eq!(record.cache_creation_tokens, 7);
+        assert_eq!(record.cache_read_tokens, 89);
+        assert_eq!(record.credits, 0.25);
+    }
+
+    #[test]
+    fn tracer_only_marks_first_token_for_streaming_requests() {
+        let mut tracer = RequestTracer {
+            store: None,
+            trace_id: "first-token-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "claude-sonnet-4".to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        tracer.mark_first_token();
+        assert!(tracer.first_token_at.lock().is_none());
+
+        tracer.is_stream = true;
+        tracer.mark_first_token();
+        let first = *tracer.first_token_at.lock();
+        assert!(first.is_some());
+
+        tracer.mark_first_token();
+        assert_eq!(*tracer.first_token_at.lock(), first);
+    }
+
+    #[test]
+    fn tracer_uses_terminal_mcp_attempt_for_failure_fields() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "mcp-failure-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "claude-sonnet-4".to_string(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+        let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
+            attempt: 0,
+            credential_id,
+            endpoint: endpoint.to_string(),
+            http_status: Some(status),
+            outcome: attempt_outcome.to_string(),
+            error_snippet: None,
+            duration_ms: 10,
+        };
+
+        tracer.on_attempt(attempt(11, "ide", 200, outcome::SUCCESS));
+        tracer.on_attempt(attempt(29, "cli", 503, outcome::TRANSIENT));
+        tracer.finalize(
+            "error",
+            last_attempt_outcome(&tracer),
+            Some("MCP request failed"),
+            None,
+            TraceUsage::zero(),
+        );
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        let record = &records[0];
+        assert_eq!(record.final_credential_id, 29);
+        assert_eq!(record.error_type.as_deref(), Some(outcome::TRANSIENT));
+        assert_eq!(record.total_attempts, 2);
+        assert_eq!(record.attempts[0].endpoint, "ide");
+        assert_eq!(record.attempts[1].endpoint, "cli");
+    }
+
+    #[test]
     fn account_suspended_attempt_is_preserved_as_request_error_type() {
         assert_eq!(
             canonical_attempt_outcome(outcome::ACCOUNT_SUSPENDED),
@@ -2164,6 +2411,44 @@ mod tests {
         assert_eq!(models[0].display_name, "Configured GPT");
         assert_eq!(models[0].owned_by, "configured-owner");
         assert_eq!(models[0].max_tokens, 12_345);
+    }
+
+    #[test]
+    fn non_stream_usage_prefers_sanitized_provider_snapshot() {
+        let fallback_cache = super::super::cache_metering::CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+        let provider = TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 11,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        };
+
+        assert_eq!(
+            resolve_non_stream_usage(100, Some(80), 9, fallback_cache, Some(provider)),
+            (3, 11, 4, 7)
+        );
+    }
+
+    #[test]
+    fn non_stream_usage_falls_back_to_context_and_cache_split() {
+        let cache_usage = super::super::cache_metering::CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+
+        assert_eq!(
+            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
+            (40, 9, 20, 20)
+        );
+        assert_eq!(
+            resolve_non_stream_usage(100, None, -9, Default::default(), None),
+            (100, 0, 0, 0)
+        );
     }
 
     #[test]
