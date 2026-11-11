@@ -1487,6 +1487,88 @@ async fn routed(fixture: &Fixture, store: Option<Arc<TraceStore>>) -> Routed {
     Routed { address, client, server }
 }
 
+/// `GET /traces` on the admin router, backed by `store`.
+async fn admin_traces(fixture: &Fixture, store: Arc<TraceStore>) -> Vec<serde_json::Value> {
+    use crate::admin::{
+        AdminService, AdminState, ClientKeyManager, GroupManager, UsageAggregator,
+        create_admin_router,
+    };
+    let manager = fixture.state.kiro_provider.as_ref().unwrap().token_manager();
+    let app = create_admin_router(AdminState::new(
+        "fixture-admin-only",
+        AdminService::new(manager.clone(), vec!["fixture".into()]),
+        Arc::new(ClientKeyManager::new()),
+        Arc::new(UsageAggregator::new()),
+        store,
+        Arc::new(GroupManager::new()),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/traces", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let body: serde_json::Value = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(&url)
+        .header("x-api-key", "fixture-admin-only")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    server.abort();
+    body["records"].as_array().unwrap().clone()
+}
+
+#[tokio::test]
+async fn admin_traces_api_exposes_timing_and_leaves_old_rows_null() {
+    use crate::admin::trace_db::TraceRecord;
+    use crate::common::timing::{Arrival, ContentKind, ContentTally, Decoded, Ledger};
+
+    let mut old: TraceRecord = serde_json::from_value(json!({
+        "traceId": "old", "ts": "2026-11-01T00:00:00+00:00", "keyId": 0,
+        "keySource": "masterApiKey", "model": "m", "isStream": true,
+        "finalStatus": "success", "finalCredentialId": 1, "totalAttempts": 1,
+        "durationMs": 900, "outputTokens": 120, "attempts": []
+    }))
+    .unwrap();
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    store.insert(&old);
+
+    let mut ledger = Ledger::default();
+    ledger.upstream_call(1_000);
+    let mut content = ContentTally::default();
+    content.add(ContentKind::Text, 40);
+    for at in [2_000, 602_000] {
+        ledger.upstream_chunk(Arrival { poll_started: at, at, bytes: 60 });
+        ledger.decoded(at, &Decoded { frames: 1, content, final_usage: false });
+    }
+    old.trace_id = "new".into();
+    old.ts = "2026-11-02T00:00:00+00:00".into();
+    old.endpoint = Some("chat".into());
+    old.output_tokens_source = Some("exact".into());
+    old.timing = Some(ledger.summarize(700_000));
+    store.insert(&old);
+
+    let f = fixture(Mode::Reply(&["ok"])).await;
+    let records = admin_traces(&f, store).await;
+    let (new, old) = (&records[0], &records[1]);
+    assert_eq!((&new["traceId"], &old["traceId"]), (&json!("new"), &json!("old")));
+    assert_eq!(new["endpoint"], "chat");
+    assert_eq!(new["outputTokensSource"], "exact");
+    assert_eq!(new["timing"]["v"], 1);
+    assert_eq!(new["timing"]["totalUs"], 700_000);
+    assert_eq!(new["timing"]["phases"]["upstreamHeadersUs"], 1_000);
+    assert_eq!(new["timing"]["stream"]["receiveGaps"]["counts"].as_array().unwrap().len(), 12);
+    assert_eq!(new["throughput"]["outputTps"], 200.0);
+    assert_eq!(new["throughput"]["outputTokensSource"], "exact");
+    assert_eq!(old["durationMs"], 900);
+    for field in ["endpoint", "outputTokensSource", "timing", "throughput"] {
+        assert!(old[field].is_null(), "{field}: {}", old[field]);
+    }
+}
+
 fn percentile(samples: &mut [f64], q: f64) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples[((samples.len() - 1) as f64 * q).round() as usize]

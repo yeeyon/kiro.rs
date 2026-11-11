@@ -16,6 +16,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
 
+use crate::common::timing::{OutputTokens, Summary, Throughput};
+
 /// trace 记录默认保留天数
 const DEFAULT_RETENTION_DAYS: u64 = 7;
 /// 上游错误体片段最大长度（字节）
@@ -142,8 +144,27 @@ pub struct TraceRecord {
     /// 客户端 IP（转发头优先，回落到 TCP 对端）。None = 老记录 / 无法确定。
     #[serde(default)]
     pub client_ip: Option<String>,
+    /// Client-facing API the request entered through: `messages`, `cc`, `chat`,
+    /// `responses` or `other`. None on rows written before this column existed.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Where `output_tokens` came from: `exact`, `estimated` or `unavailable`.
+    /// Independent of `usage_source`, which describes the input and cache split.
+    #[serde(default)]
+    pub output_tokens_source: Option<String>,
+    /// Per-request phase timing and cadence summary.
+    #[serde(default)]
+    pub timing: Option<Summary>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
+}
+
+impl TraceRecord {
+    /// Rates derived from the timing summary. None on rows without one.
+    pub fn throughput(&self) -> Option<Throughput> {
+        let tokens = OutputTokens::from_stored(self.output_tokens_source.as_deref()?, self.output_tokens)?;
+        Some(self.timing.as_ref()?.throughput(tokens))
+    }
 }
 
 /// 会话粘性路由结果（record.sticky_outcome 取值）
@@ -327,7 +348,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 12] = [
+        let columns: [(&str, &str); 15] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -340,6 +361,9 @@ impl TraceStore {
             ("previous_credential_id", "INTEGER"),
             ("usage_source", "TEXT"),
             ("client_ip", "TEXT"),
+            ("endpoint", "TEXT"),
+            ("output_tokens_source", "TEXT"),
+            ("timing", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -403,6 +427,10 @@ impl TraceStore {
         let ts_epoch = chrono::DateTime::parse_from_rfc3339(&rec.ts)
             .map(|d| d.timestamp())
             .unwrap_or_else(|_| Utc::now().timestamp());
+        let timing = rec
+            .timing
+            .as_ref()
+            .and_then(|summary| serde_json::to_string(summary).ok());
         let res = (|| -> rusqlite::Result<()> {
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
@@ -410,9 +438,9 @@ impl TraceStore {
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, session_id, sticky_outcome, previous_credential_id, \
-                 usage_source, client_ip) \
+                 usage_source, client_ip, endpoint, output_tokens_source, timing) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
-                 ?21,?22,?23,?24,?25)",
+                 ?21,?22,?23,?24,?25,?26,?27,?28)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -439,6 +467,9 @@ impl TraceStore {
                     rec.previous_credential_id.map(|v| v as i64),
                     rec.usage_source,
                     rec.client_ip,
+                    rec.endpoint,
+                    rec.output_tokens_source,
+                    timing,
                 ],
             )?;
             for a in &rec.attempts {
@@ -609,7 +640,8 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip \
+             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip, \
+             endpoint, output_tokens_source, timing \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -641,6 +673,13 @@ impl TraceStore {
                 previous_credential_id: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
                 usage_source: row.get(22)?,
                 client_ip: row.get(23)?,
+                endpoint: row.get(24)?,
+                output_tokens_source: row.get(25)?,
+                // A summary this build cannot parse reads as absent and never fails the query.
+                timing: row
+                    .get::<_, Option<String>>(26)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .filter(|summary: &Summary| summary.v == Summary::VERSION),
                 attempts: Vec::new(),
             })
         })?;
@@ -844,7 +883,10 @@ CREATE TABLE IF NOT EXISTS traces (
     sticky_outcome    TEXT,
     previous_credential_id INTEGER,
     usage_source      TEXT,
-    client_ip         TEXT
+    client_ip         TEXT,
+    endpoint          TEXT,
+    output_tokens_source TEXT,
+    timing            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -916,6 +958,9 @@ mod tests {
             previous_credential_id: Some(input.credential_id),
             usage_source: Some(usage_source::SIMULATED.to_string()),
             client_ip: Some("203.0.113.9".to_string()),
+            endpoint: None,
+            output_tokens_source: None,
+            timing: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -1329,6 +1374,155 @@ mod tests {
         assert_eq!(out[0].session_id.as_deref(), Some("sess-1"));
         assert_eq!(out[0].sticky_outcome.as_deref(), Some(sticky::HIT));
         assert_eq!(out[0].client_ip.as_deref(), Some("203.0.113.9"));
+    }
+
+    /// The `traces.db` schema as released in v0.9.8. Frozen: do not update it with SCHEMA.
+    const V0_9_8_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS traces (
+    trace_id          TEXT PRIMARY KEY,
+    ts                TEXT NOT NULL,
+    ts_epoch          INTEGER NOT NULL,
+    key_id            INTEGER NOT NULL,
+    key_source        TEXT,
+    model             TEXT NOT NULL,
+    is_stream         INTEGER NOT NULL,
+    final_status      TEXT NOT NULL,
+    final_credential_id INTEGER NOT NULL,
+    error_type        TEXT,
+    error_message     TEXT,
+    total_attempts    INTEGER NOT NULL,
+    duration_ms       INTEGER NOT NULL,
+    interrupted_after_bytes INTEGER,
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    credits           REAL NOT NULL DEFAULT 0,
+    first_token_ms    INTEGER,
+    session_id        TEXT,
+    sticky_outcome    TEXT,
+    previous_credential_id INTEGER,
+    usage_source      TEXT,
+    client_ip         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
+CREATE INDEX IF NOT EXISTS idx_traces_cred ON traces(final_credential_id);
+CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id);
+CREATE INDEX IF NOT EXISTS idx_traces_client_ip ON traces(client_ip);
+
+CREATE TABLE IF NOT EXISTS trace_attempts (
+    trace_id      TEXT NOT NULL,
+    attempt       INTEGER NOT NULL,
+    credential_id INTEGER NOT NULL,
+    endpoint      TEXT NOT NULL,
+    http_status   INTEGER,
+    outcome       TEXT NOT NULL,
+    error_snippet TEXT,
+    duration_ms   INTEGER NOT NULL,
+    PRIMARY KEY (trace_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
+";
+
+    fn timing_sample() -> Summary {
+        use crate::common::timing::{Arrival, ContentKind, ContentTally, Decoded, Ledger, Phase, Span};
+        let mut ledger = Ledger::default();
+        ledger.mark(Phase::BodyParsed, 150);
+        ledger.mark(Phase::Prepared, 900);
+        ledger.span(Span::HeadersWait, 40_000);
+        ledger.upstream_call(41_000);
+        let mut content = ContentTally::default();
+        content.add(ContentKind::Text, 2_000);
+        for at in [50_000, 550_000] {
+            ledger.upstream_chunk(Arrival { poll_started: at - 5_000, at, bytes: 2_100 });
+            ledger.decoded(at, &Decoded { frames: 1, content, final_usage: at == 550_000 });
+            ledger.emitted(at + 100, &content);
+        }
+        ledger.summarize(560_000)
+    }
+
+    #[test]
+    fn v0_9_8_database_gains_timing_columns_and_keeps_its_rows() {
+        let path = std::env::temp_dir().join(format!("traces-v098-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V0_9_8_SCHEMA).unwrap();
+            conn.execute_batch(
+                "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
+                 final_status, final_credential_id, total_attempts, duration_ms, output_tokens, \
+                 first_token_ms, usage_source) VALUES ('old', '2026-11-01T00:00:00+00:00', \
+                 1793491200, 0, 'masterApiKey', 'm-old', 1, 'success', 3, 1, 1200, 17, 340, 'provider');
+                 INSERT INTO trace_attempts (trace_id, attempt, credential_id, endpoint, \
+                 http_status, outcome, duration_ms) VALUES ('old', 0, 3, 'ide', 200, 'success', 300);",
+            )
+            .unwrap();
+        }
+
+        // Opening twice runs the migration twice.
+        for _ in 0..2 {
+            let store = TraceStore::open(path.clone(), true, 7).unwrap();
+            let old = store.query(&TraceQuery { limit: 10, ..Default::default() });
+            assert_eq!(old.len(), 1);
+            assert_eq!((old[0].duration_ms, old[0].first_token_ms), (1200, Some(340)));
+            assert_eq!(old[0].usage_source.as_deref(), Some("provider"));
+            assert_eq!(old[0].attempts.len(), 1);
+            assert_eq!(old[0].endpoint, None);
+            assert_eq!(old[0].output_tokens_source, None);
+            assert_eq!(old[0].timing, None);
+            assert!(old[0].throughput().is_none());
+        }
+
+        let store = TraceStore::open(path.clone(), true, 7).unwrap();
+        let mut rec = sample(TraceSample { trace_id: "new", status: "success", credential_id: 5, model: "m1" });
+        rec.endpoint = Some("responses".to_string());
+        rec.output_tokens_source = Some("exact".to_string());
+        rec.timing = Some(timing_sample());
+        store.insert(&rec);
+        let out = store.query(&TraceQuery { model: Some("m1".to_string()), limit: 10, ..Default::default() });
+        assert_eq!(out[0].endpoint.as_deref(), Some("responses"));
+        assert_eq!(out[0].timing, rec.timing);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn timing_summary_and_token_source_round_trip() {
+        let store = TraceStore::open_in_memory().unwrap();
+        let mut rec = sample(TraceSample { trace_id: "t1", status: "success", credential_id: 5, model: "m1" });
+        rec.endpoint = Some("chat".to_string());
+        rec.output_tokens_source = Some("estimated".to_string());
+        rec.output_tokens = 100;
+        rec.timing = Some(timing_sample());
+        store.insert(&rec);
+
+        let out = store.query(&TraceQuery { limit: 10, ..Default::default() });
+        assert_eq!(out[0].endpoint.as_deref(), Some("chat"));
+        assert_eq!(out[0].output_tokens_source.as_deref(), Some("estimated"));
+        assert_eq!(out[0].timing, rec.timing);
+        let throughput = out[0].throughput().unwrap();
+        assert_eq!(throughput.output_tps, Some(200.0));
+        assert_eq!(throughput.output_tokens_source, "estimated");
+    }
+
+    #[test]
+    fn unreadable_timing_reads_as_absent_without_failing_the_query() {
+        let store = TraceStore::open_in_memory().unwrap();
+        let future = serde_json::to_string(&Summary { v: 2, ..timing_sample() }).unwrap();
+        for (trace_id, timing) in [("garbage", "not json"), ("future", future.as_str())] {
+            store.insert(&sample(TraceSample { trace_id, status: "success", credential_id: 5, model: "m1" }));
+            store
+                .conn
+                .lock()
+                .execute("UPDATE traces SET timing = ?1 WHERE trace_id = ?2", [timing, trace_id])
+                .unwrap();
+        }
+
+        let (out, total) = store.query_paged(&TraceQuery { limit: 10, ..Default::default() });
+        assert_eq!((out.len(), total), (2, 2));
+        assert!(out.iter().all(|rec| rec.timing.is_none()));
     }
 
     #[test]

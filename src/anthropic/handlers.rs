@@ -335,6 +335,9 @@ impl RequestTracer {
             previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
             usage_source: usage.source.as_db().map(|s| s.to_string()),
             client_ip: self.client_ip.clone(),
+            endpoint: None,
+            output_tokens_source: None,
+            timing: None,
             attempts,
         };
         store.insert(&rec);

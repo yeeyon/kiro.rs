@@ -1872,6 +1872,7 @@ pub async fn list_traces(
                     })
                 })
                 .collect();
+            let throughput = r.throughput();
             serde_json::json!({
                 "traceId": r.trace_id,
                 "ts": r.ts,
@@ -1900,6 +1901,10 @@ pub async fn list_traces(
                 "previousCredentialId": r.previous_credential_id,
                 "usageSource": r.usage_source,
                 "clientIp": r.client_ip,
+                "endpoint": r.endpoint,
+                "outputTokensSource": r.output_tokens_source,
+                "timing": r.timing,
+                "throughput": throughput,
                 "attempts": attempts,
             })
         })
