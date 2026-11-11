@@ -1912,7 +1912,8 @@ async fn gateway_router_cadence_measurement() {
     const EVERY: Duration = Duration::from_millis(5);
     let f = fixture(Mode::Cadence { events: EVENTS, every: EVERY }).await;
     let store = Arc::new(TraceStore::open_in_memory().unwrap());
-    let routed = routed(&f, Some(store), false).await;
+    let routed = routed(&f, Some(store.clone()), false).await;
+    let mut seen = HashSet::new();
     for api in ROUTED_APIS {
         for _ in 0..WARMUP {
             measure_stream(&routed, api).await;
@@ -1935,6 +1936,27 @@ async fn gateway_router_cadence_measurement() {
             percentile(&mut total, 0.95),
             percentile(&mut gap, 0.5),
             percentile(&mut gap, 0.95),
+        );
+        // The gateway's own view of one request, to place the client-side gap.
+        measure_stream(&routed, api).await;
+        seen.extend(
+            store
+                .query_paged(&TraceQuery { limit: 1000, ..Default::default() })
+                .0
+                .into_iter()
+                .map(|record| record.trace_id),
+        );
+        let (_, _, client_gap) = measure_stream(&routed, api).await;
+        let timing = next_trace(&store, &mut seen).await.timing.unwrap();
+        let stream = timing.stream.unwrap();
+        println!(
+            "CADENCE_TRACE api={api} client_gap_max_ms={client_gap:.3} \
+             upstream_receive_gap_max_ms={:.3} emit_gap_max_ms={:.3} \
+             downstream_wait_max_ms={:.3} first_emit_text_ms={:.3}",
+            stream.receive_gaps.max as f64 / 1000.0,
+            stream.emit_gaps.max as f64 / 1000.0,
+            stream.downstream_wait.max_us as f64 / 1000.0,
+            timing.phases.first_emit_text_us.unwrap() as f64 / 1000.0,
         );
     }
 }

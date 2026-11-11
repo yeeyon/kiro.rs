@@ -120,3 +120,177 @@ cargo test --locked --offline gateway_latency_measurement -- --ignored --nocaptu
 Captured local evidence is in `target/gateway-before.txt`,
 `target/gateway-after-final.txt`, `target/gateway-final-tests.txt`, and the
 `target/gateway-*-red.txt` files. These build-directory logs are not committed.
+
+## Request timing summary
+
+Each traced inference request stores one timing summary in `traces.db`. It
+answers where the time before the first response went and how evenly the
+stream arrived. It records measurements only: clients receive the same bytes,
+and retries, token refresh and routing are unchanged.
+
+The summary covers `/v1/messages`, `/cc/v1/messages`, `/v1/chat/completions`
+and `/v1/responses`, stream and non-stream. It stores no prompt, body or
+credential, and its size is fixed.
+
+### Where to read it
+
+`GET /api/admin/traces` returns four more fields per record. Records written
+before this version return `null` for all four.
+
+| Field | Content |
+| --- | --- |
+| `endpoint` | `messages`, `cc`, `chat`, `responses`, or `other` when a handler was called without its route |
+| `outputTokensSource` | `exact`, `estimated` or `unavailable` |
+| `timing` | the stored summary, `v: 1` |
+| `throughput` | rates and gap quantiles computed from `timing` when the record is read |
+
+In SQL the summary is the JSON column `timing`, for example
+`json_extract(timing, '$.phases.firstEmitTextUs')`.
+
+All times are microseconds. Every offset counts from the moment the auth
+middleware first saw the request, before the body was read. The existing
+`durationMs` and `firstTokenMs` keep their meaning: they count from the later
+point where the request tracer is created.
+
+### `timing.phases`
+
+Each phase is recorded once. `null` means it did not happen.
+
+| Field | Moment |
+| --- | --- |
+| `bodyParsedUs` | The inference handler took over: auth, body read and JSON parsing are done. For Chat and Responses this includes the translation to a Messages request. |
+| `preparedUs` | Conversion to the Kiro request, serialization, token counting and cache metering are done. |
+| `upstreamHeadersUs` | The first upstream call returned a 2xx response head. |
+| `firstBodyBytesUs` | First non-empty upstream body chunk. |
+| `firstDecodedContentUs` | First upstream event with thinking, text or tool data, before any buffering in the gateway. |
+| `firstEmitThinkingUs`, `firstEmitTextUs`, `firstEmitToolUs` | First Messages event of that kind handed to the response body. Stream requests only. |
+
+`firstEmitTextUs - firstDecodedContentUs` is the time the gateway held the
+content. With `output_config.format` it is the whole answer, because the
+stream is rewritten at the end.
+
+### `timing.spans`
+
+Steps of the provider call that can repeat (retries, web-search rounds). Each
+has `totalUs`, `count` and `maxUs`.
+
+| Field | Step |
+| --- | --- |
+| `credentialSelect` | Choosing a credential, without the two refresh steps. A failed selection reports its whole wait here. |
+| `refreshLockWait` | Waiting for the token refresh lock. |
+| `tokenRefresh` | Refreshing the token while holding the lock, and the forced refresh after a 403. |
+| `profileResolve` | Resolving the profile ARN. |
+| `headersWait` | Request written to response head received, once per attempt. |
+| `errorBodyRead` | Reading the body of a failed attempt. |
+| `backoff` | Sleeping between retries. |
+
+### `timing.stream`
+
+Present when an upstream call returned a response head.
+
+| Field | Content |
+| --- | --- |
+| `upstreamCalls`, `chunks`, `bytes` | Upstream calls, body chunks and body bytes. |
+| `upstreamWaitUs` | Time spent waiting for upstream body chunks. |
+| `downstreamWait` | Time between handing a batch to the response body and asking the upstream for more. This is the response writer and the client. Zero for non-stream requests. |
+| `receiveGaps` | Histogram of the time between two upstream chunks of one call. |
+| `emitGaps` | Histogram of the time between two content batches handed to the response body. Keep-alive pings are not content. |
+| `framesPerChunk` | Histogram of frames decoded per upstream chunk. |
+| `contentEmits` | Content batches handed to the response body. |
+| `lastContentUs`, `finalUsageUs`, `upstreamEosUs` | Last decoded content, last `metadataEvent.tokenUsage`, clean end of the last upstream body. |
+| `generation`, `thinking`, `text`, `tool` | `windowUs` (first to last decoded event), `events` and `bytes`, for all content and per kind. |
+
+A histogram has `counts` (12 buckets), `n`, `sum` and `max`. A value goes into
+the first bucket whose upper bound is not below it; the last bucket is open.
+Gap bounds in ms: 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500. Frame
+bounds: 0, 1, 2, 3, 4, 6, 8, 12, 16, 32, 64.
+
+Delivery is pull-based, so a long receive gap can come from either side. Read
+it with the two sums: a large `upstreamWaitUs` share points at the upstream or
+the network to it, and a large `downstreamWait` points at the client side.
+
+A request with several upstream calls (the web-search loop) adds each call's
+windows together. The pause between two calls is not a gap and not generation
+time.
+
+### Output tokens and throughput
+
+`outputTokensSource` says where `outputTokens` came from. It is separate from
+`usageSource`, which describes the input and cache split.
+
+| Value | Meaning |
+| --- | --- |
+| `exact` | Every upstream call of the request sent `metadataEvent.tokenUsage`. |
+| `estimated` | Counted locally from the content. |
+| `unavailable` | The request failed or was cancelled before usage was known, or the upstream reported zero although content arrived. |
+
+`throughput.outputTps` is `outputTokens` divided by `generation.windowUs`. The
+window runs from the first to the last decoded content of each upstream call.
+It excludes the wait before the first content and the wait for usage after the
+last content. The value is `null` unless the window is at least 250 ms and has
+two or more content events, and `throughput.outputTokensSource` always names
+the token source next to it. The token count covers thinking, text and tool
+arguments together, and the tokens of the first event were generated before
+the window opens, so short answers read slightly high.
+
+`textBytesPerSec` and `thinkingBytesPerSec` use each kind's own window and the
+same two conditions. `emitGapP50Us`, `emitGapP95Us`, `receiveGapP50Us` and
+`receiveGapP95Us` are the upper bound of the histogram bucket that holds the
+quantile, not exact values.
+
+### Limitations
+
+- Emit marks are taken where the Messages stream hands a batch to the response
+  body. Chat and Responses translate that stream afterwards, and their own
+  first event is not timed. Chat drops thinking, so `firstEmitThinkingUs` on a
+  `chat` record is content the client never received.
+- Handed to the response body is not delivered. The client may read later.
+- Content kinds are counted at decode time. A `<thinking>` tag inside
+  assistant text counts as text there.
+- The mixed web-search loop records provider spans, upstream cadence and
+  decoded content, but no emit marks, and its tracer is created before
+  conversion, so `preparedUs` is early. Its `firstTokenMs` still means first
+  upstream chunk.
+- Remote compaction (Responses) creates its tracer after conversion, so
+  `bodyParsedUs` and `preparedUs` are close together.
+- A pure web-search request, and a request rejected before any provider call,
+  still writes no trace record.
+- The upstream fixture uses API-key credentials, so the tests do not exercise
+  the refresh spans. Live authentication and platform behaviour are not
+  covered by any test here.
+- Connection reuse is not recorded.
+
+### Measured overhead
+
+`gateway_router_cadence_measurement` sends 200 streaming requests per API
+through the production router on a real socket. The upstream fixture sends 8
+text deltas 5 ms apart, one frame per chunk. Tracing is on in both columns.
+Before is commit `e4e99a6` (the bench alone), after is `da62c60` (timing
+recorded). Each value is the median of three runs that alternated between the
+two commits, debug build, Docker Linux on a Windows host, November 11, 2026.
+
+| API | First text P50 before | First text P50 after | Total P50 before | Total P50 after |
+| --- | ---: | ---: | ---: | ---: |
+| `/v1/messages` | 2.66 ms | 2.72 ms | 53.77 ms | 54.01 ms |
+| `/cc/v1/messages` | 3.31 ms | 2.73 ms | 54.85 ms | 54.17 ms |
+| `/v1/chat/completions` | 3.20 ms | 2.67 ms | 53.97 ms | 53.91 ms |
+| `/v1/responses` | 3.19 ms | 3.11 ms | 54.18 ms | 54.33 ms |
+
+The differences are below the spread between runs of one commit, which
+reached 2.9 ms for first text P50 (`/v1/chat/completions` before: 2.66 to
+5.53 ms). The run shows no overhead larger than that spread. It cannot prove
+a difference below it.
+
+The bench also prints the gateway's own view of one request per API. In this
+fixture the longest gap between text chunks at the client was about 43 ms,
+although the deltas are sent 5 ms apart. The summary places it on the upstream
+side. In the two sampled requests that showed the gap, `receiveGaps.max` was
+41 and 42 ms and `downstreamWait.maxUs` was 0.2 ms; in the other two the
+client gap and `receiveGaps.max` were both 7 ms. The gap is on the hop between
+the local fixture and the gateway, not in the gateway's response. It says
+nothing about the real Kiro upstream.
+
+```powershell
+cargo test --locked gateway_router_cadence_measurement -- --ignored --nocapture
+cargo test --locked router_timing
+```
