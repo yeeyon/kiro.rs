@@ -19,6 +19,8 @@ pub enum Phase {
     /// For Chat and Responses this also includes the adapter's translation to Messages.
     BodyParsed,
     /// Conversion, serialization, token counting and cache metering are done.
+    /// The mixed web-search path builds its tracer before conversion, so there this
+    /// mark is taken earlier than that and does not bound preparation.
     Prepared,
     /// The first upstream call returned a 2xx response head.
     UpstreamHeaders,
@@ -198,7 +200,7 @@ impl ContentTally {
 }
 
 /// One upstream body chunk as the reader saw it.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Arrival {
     /// When the reader started waiting for this chunk.
     pub poll_started: Micros,

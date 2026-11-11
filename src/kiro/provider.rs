@@ -836,7 +836,8 @@ impl KiroProvider {
                 .token_manager
                 .acquire_context_routed(model.as_deref(), group, session_id.as_deref())
                 .await;
-            Self::report_acquire(sink, attempt_start.elapsed(), acquired.as_ref().ok());
+            let refresh = acquired.as_ref().ok().map(|(ctx, _)| ctx.refresh);
+            Self::report_acquire(sink, attempt_start.elapsed(), refresh);
             let mut ctx = match acquired {
                 Ok((c, route)) => {
                     // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
@@ -1396,13 +1397,13 @@ impl KiroProvider {
 
     /// Split the time spent acquiring a call context into credential selection and
     /// token refresh. A failed acquire has no split, so all of it counts as selection.
-    fn report_acquire<R>(
+    fn report_acquire(
         sink: Option<&dyn TraceSink>,
         elapsed: Duration,
-        acquired: Option<&(crate::kiro::token_manager::CallContext, R)>,
+        refresh: Option<crate::kiro::token_manager::RefreshTiming>,
     ) {
         let Some(sink) = sink else { return };
-        let refresh = acquired.map(|(ctx, _)| ctx.refresh).unwrap_or_default();
+        let refresh = refresh.unwrap_or_default();
         if !refresh.lock_wait.is_zero() {
             sink.on_span(Span::RefreshLockWait, refresh.lock_wait);
         }
