@@ -9,7 +9,7 @@ use super::{
     middleware::{AppState, KeyContext},
 };
 use crate::{
-    admin::trace_db::{TraceKeySource, TraceQuery, TraceStore},
+    admin::trace_db::{TraceQuery, TraceStore},
     kiro::{
         endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint},
         model::credentials::CredentialsConfig,
@@ -88,12 +88,7 @@ async fn live_tool_modes_preserve_input_and_measure_streaming_without_execution(
                         .with_shared_kiro_provider(provider.clone())
                         .with_trace_store(Some(trace.clone())),
                 ),
-                Extension(KeyContext {
-                    key_id: 0,
-                    group: None,
-                    key_source: TraceKeySource::MasterApiKey,
-                    client_ip: None,
-                }),
+                Extension(KeyContext::master()),
                 Json(serde_json::from_value(payload).unwrap()),
             ),
         )

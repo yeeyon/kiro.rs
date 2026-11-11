@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
 
-use crate::common::timing::{OutputTokens, Summary, Throughput};
+use crate::common::timing::{OutputTokens, Span, Summary, Throughput};
 
 /// trace 记录默认保留天数
 const DEFAULT_RETENTION_DAYS: u64 = 7;
@@ -244,6 +244,10 @@ pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
     /// 凭据选择结果（粘性命中 / 换号）。默认空实现，非 trace 场景零开销。
     fn on_route(&self, _route: TraceRoute) {}
+    /// A timed step of the provider call finished.
+    fn on_span(&self, _span: Span, _elapsed: std::time::Duration) {}
+    /// An upstream call returned a 2xx response head.
+    fn on_upstream_call(&self) {}
 }
 
 /// 查询过滤条件

@@ -10,6 +10,7 @@ use crate::admin::trace_db::{
     usage_source,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
+use crate::common::timing::{Decoded, Endpoint, OutputTokens, Span};
 use crate::kiro::error::NoAvailableCredentialsError;
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::{Event, TokenUsage};
@@ -35,6 +36,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
+use super::request_timing::{RequestTiming, TimedBody, tally_event, tally_sse};
 use super::stream::{SseEvent, StreamContext};
 use super::structured_rewrite::{
     StructuredCollector, append_schema_instruction, inject_system_instruction,
@@ -147,6 +149,9 @@ pub(crate) struct RequestTracer {
     /// provider 成功返回 `reqwest::Response`，即已收到上游 HTTP 响应头。
     /// 不能用「尚未 finalize」代替这个状态：下游可能在读取 body 前取消。
     upstream_headers_received: std::sync::atomic::AtomicBool,
+    endpoint: Endpoint,
+    /// None when tracing is off: nothing is timed.
+    timing: Option<std::sync::Arc<RequestTiming>>,
 }
 
 /// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
@@ -207,11 +212,20 @@ struct RequestTraceOptions {
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
+    /// When the inference handler took over the request.
+    entered_at: Instant,
 }
 
 impl RequestTracer {
     fn new(state: &AppState, options: RequestTraceOptions) -> Self {
+        let timing = state
+            .trace_store
+            .as_ref()
+            .filter(|store| store.is_enabled())
+            .map(|_| RequestTiming::start(options.key_ctx.received_at, options.entered_at));
         Self {
+            endpoint: options.key_ctx.endpoint,
+            timing,
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
             ts: Utc::now().to_rfc3339(),
@@ -281,6 +295,33 @@ impl RequestTracer {
         }
     }
 
+    /// Wrap an upstream body so each chunk's arrival and wait are recorded.
+    pub(crate) fn timed_body<S>(&self, body: S) -> TimedBody<S> {
+        TimedBody::new(body, self.timing.clone())
+    }
+
+    /// One upstream chunk was decoded.
+    pub(crate) fn record_decoded(&self, decoded: &Decoded) {
+        if let Some(timing) = &self.timing {
+            timing.decoded(decoded);
+        }
+    }
+
+    fn record_emitted(&self, events: &[SseEvent]) {
+        if let Some(timing) = &self.timing
+            && !events.is_empty()
+        {
+            timing.emitted(&tally_sse(events));
+        }
+    }
+
+    /// The upstream body of the current call ended cleanly.
+    pub(crate) fn mark_upstream_eos(&self) {
+        if let Some(timing) = &self.timing {
+            timing.upstream_eos();
+        }
+    }
+
     pub(crate) fn discard(&self) {
         self.finalized.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -310,6 +351,14 @@ impl RequestTracer {
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
         let route = self.route.lock().take();
+        // Every real usage snapshot names its source; `Unknown` is the no-usage exit.
+        let reported_output_tokens =
+            (usage.source != UsageSource::Unknown).then_some(usage.output_tokens);
+        let (timing, output_tokens) = self
+            .timing
+            .as_ref()
+            .map(|timing| timing.snapshot(reported_output_tokens))
+            .unzip();
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -335,9 +384,9 @@ impl RequestTracer {
             previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
             usage_source: usage.source.as_db().map(|s| s.to_string()),
             client_ip: self.client_ip.clone(),
-            endpoint: None,
-            output_tokens_source: None,
-            timing: None,
+            endpoint: Some(self.endpoint.as_str().to_string()),
+            output_tokens_source: output_tokens.map(|tokens: OutputTokens| tokens.source().to_string()),
+            timing,
             attempts,
         };
         store.insert(&rec);
@@ -395,6 +444,18 @@ impl TraceSink for RequestTracer {
         let mut slot = self.route.lock();
         if slot.is_none() {
             *slot = Some(route);
+        }
+    }
+
+    fn on_span(&self, span: Span, elapsed: Duration) {
+        if let Some(timing) = &self.timing {
+            timing.span(span, elapsed);
+        }
+    }
+
+    fn on_upstream_call(&self) {
+        if let Some(timing) = &self.timing {
+            timing.upstream_call();
         }
     }
 }
@@ -1028,6 +1089,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: payload_stream,
+                entered_at: hook.started_at,
             },
         ));
         return super::websearch_loop::run_web_search_loop(
@@ -1159,6 +1221,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                entered_at: hook.started_at,
             },
         ));
         handle_stream_request(
@@ -1191,6 +1254,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                entered_at: hook.started_at,
             },
         ));
         handle_non_stream_request(
@@ -1346,7 +1410,7 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
+    let body_stream = tracer.timed_body(response.bytes_stream());
     let mut settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx, in_flight);
     settlement.structured = structured;
 
@@ -1371,11 +1435,13 @@ fn create_sse_stream(
                             }
 
                             let mut events = Vec::new();
+                            let mut decoded = Decoded::default();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         match Event::from_frame(frame) {
                                             Ok(event) => {
+                                                tally_event(&mut decoded, &event);
                                                 if let Some((error, failure)) = upstream_event_error(&event) {
                                                     let bytes = settlement.interrupt(&mut ctx, events, &failure, &error, sent_bytes);
                                                     return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
@@ -1400,12 +1466,9 @@ fn create_sse_stream(
                                 }
                             }
 
+                            settlement.tracer.record_decoded(&decoded);
                             let events = settlement.hold_if_structured(events);
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            let bytes = settlement.emit(events);
                             settlement.update(&ctx, sent_bytes);
 
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
@@ -1426,9 +1489,13 @@ fn create_sse_stream(
                             }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
+                            settlement.tracer.mark_upstream_eos();
                             let final_events = ctx.generate_final_events();
                             let final_events = settlement.finish_structured(final_events);
                             settlement.tracer.mark_first_content(&final_events);
+                            // Serialized before `finish` writes the trace row, so the row
+                            // includes this last batch.
+                            let bytes = settlement.emit(final_events);
                             settlement.update(&ctx, sent_bytes);
                             if let Some(message) = ctx.tool_stream_refusal_message() {
                                 settlement.finish(
@@ -1455,10 +1522,6 @@ fn create_sse_stream(
                             } else {
                                 settlement.finish("success", "success", None, None, None);
                             }
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                     }
@@ -1533,6 +1596,7 @@ impl StreamSettlement {
         tracing::error!(error, error_type = failure.error_type, "Upstream response stream was interrupted");
         // M3：把上游原因归类后告诉客户端（限流 / 过载 / 输入过长 / 权限 / 可重试中断）。
         events.extend(ctx.generate_error_events(failure.error_type, &failure.message));
+        let emitted = self.emit(events);
         self.update(ctx, bytes);
         self.finish(
             "error",
@@ -1541,6 +1605,13 @@ impl StreamSettlement {
             Some(error),
             Some(bytes),
         );
+        emitted
+    }
+
+    /// Serialize a batch for the response body and record what it hands over. Every
+    /// batch that leaves the stream goes through here; keep-alive pings do not.
+    fn emit(&self, events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>> {
+        self.tracer.record_emitted(&events);
         events
             .into_iter()
             .map(|event| Ok(Bytes::from(event.to_sse_string())))
@@ -1649,6 +1720,7 @@ pub(crate) fn new_non_stream_request_tracer(
     state: &AppState,
     key_ctx: KeyContext,
     model: String,
+    entered_at: Instant,
 ) -> std::sync::Arc<RequestTracer> {
     std::sync::Arc::new(RequestTracer::new(
         state,
@@ -1656,6 +1728,7 @@ pub(crate) fn new_non_stream_request_tracer(
             key_ctx,
             model,
             is_stream: false,
+            entered_at,
         },
     ))
 }
@@ -1911,7 +1984,7 @@ pub(crate) async fn execute_non_stream_request(
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
-    let mut body_stream = response.bytes_stream();
+    let mut body_stream = tracer.timed_body(response.bytes_stream());
     let mut decoder = EventStreamDecoder::new();
     let mut received_data = false;
 
@@ -1970,6 +2043,7 @@ pub(crate) async fn execute_non_stream_request(
                 StreamFailure::interrupted("malformed event frame from upstream"),
             ));
         }
+        let mut decoded = Decoded::default();
         for result in decoder.decode_iter() {
             match result {
                 Ok(frame) => {
@@ -1986,6 +2060,7 @@ pub(crate) async fn execute_non_stream_request(
                             ));
                         }
                     };
+                    tally_event(&mut decoded, &event);
                     if let Some((error, failure)) = upstream_event_error(&event) {
                         return Err(non_stream_read_failure(
                             &hook,
@@ -2100,6 +2175,7 @@ pub(crate) async fn execute_non_stream_request(
                 }
             }
         }
+        tracer.record_decoded(&decoded);
     }
 
     if !received_data || decoder.has_pending_data() {
@@ -2112,6 +2188,7 @@ pub(crate) async fn execute_non_stream_request(
             StreamFailure::interrupted(if received_data { "upstream ended with an incomplete event frame" } else { "upstream returned an empty event stream" }),
         ));
     }
+    tracer.mark_upstream_eos();
 
     // 收尾：无参工具的 0 字节滞留缓冲在此还原为 {} 补进 content；累积了非空内容
     // 却从未收到 stop=true 的（上游在参数写到一半时截断）返回 IncompleteJson。
@@ -2548,6 +2625,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: payload_stream,
+                entered_at: hook.started_at,
             },
         ));
         return super::websearch_loop::run_web_search_loop(
@@ -2678,6 +2756,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                entered_at: hook.started_at,
             },
         ));
         handle_cc_stream_request(
@@ -2707,6 +2786,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                entered_at: hook.started_at,
             },
         ));
         handle_non_stream_request(
@@ -2787,10 +2867,11 @@ fn fill_session_metadata_from_headers(payload: &mut MessagesRequest, headers: &H
 /// `POST /v1/messages` 路由入口：先按请求头补会话 metadata，再交给 post_messages。
 pub async fn post_messages_route(
     State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
+    Extension(mut key_ctx): Extension<KeyContext>,
     headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    key_ctx.endpoint = Endpoint::Messages;
     fill_session_metadata_from_headers(&mut payload, &headers);
     post_messages(State(state), Extension(key_ctx), JsonExtractor(payload)).await
 }
@@ -2798,10 +2879,11 @@ pub async fn post_messages_route(
 /// `POST /cc/v1/messages` 路由入口：先按请求头补会话 metadata，再交给 post_messages_cc。
 pub async fn post_messages_cc_route(
     State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
+    Extension(mut key_ctx): Extension<KeyContext>,
     headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    key_ctx.endpoint = Endpoint::ClaudeCode;
     fill_session_metadata_from_headers(&mut payload, &headers);
     post_messages_cc(State(state), Extension(key_ctx), JsonExtractor(payload)).await
 }
@@ -2944,12 +3026,8 @@ mod tests {
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx: KeyContext {
-                    key_id: 0,
-                    group: None,
-                    key_source: TraceKeySource::MasterApiKey,
-                    client_ip: None,
-                },
+                key_ctx: KeyContext::master(),
+                entered_at: hook.started_at,
                 model: "test-model".to_string(),
                 is_stream: true,
             },
@@ -2991,12 +3069,8 @@ mod tests {
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx: KeyContext {
-                    key_id: 0,
-                    group: None,
-                    key_source: TraceKeySource::MasterApiKey,
-                    client_ip: None,
-                },
+                key_ctx: KeyContext::master(),
+                entered_at: hook.started_at,
                 model: "test-model".to_string(),
                 is_stream: true,
             },
@@ -3053,6 +3127,8 @@ mod tests {
             route: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            endpoint: Endpoint::Other,
+            timing: None,
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -3126,6 +3202,8 @@ mod tests {
             route: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            endpoint: Endpoint::Other,
+            timing: None,
         };
 
         tracer.mark_first_token();
@@ -3160,6 +3238,8 @@ mod tests {
             route: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            endpoint: Endpoint::Other,
+            timing: None,
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -3216,6 +3296,8 @@ mod tests {
                 route: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+                endpoint: Endpoint::Other,
+                timing: None,
             };
             // 不调用任何 finalize，直接离开作用域触发 Drop
         }
@@ -3259,6 +3341,8 @@ mod tests {
                 route: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+                endpoint: Endpoint::Other,
+                timing: None,
             };
             tracer.mark_upstream_headers_received();
             // 不调用 finalize，直接离开作用域模拟 headers 已到后 handler/body 被取消。
@@ -3299,6 +3383,8 @@ mod tests {
                 route: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+                endpoint: Endpoint::Other,
+                timing: None,
             };
             tracer.finalize("success", None, None, None, TraceUsage::zero());
             // 离开作用域触发 Drop —— 应被幂等守卫拦下
@@ -3333,6 +3419,8 @@ mod tests {
                 route: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+                endpoint: Endpoint::Other,
+                timing: None,
             };
             tracer.discard();
         }

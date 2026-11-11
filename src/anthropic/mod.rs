@@ -27,6 +27,7 @@ mod converter;
 mod handlers;
 mod middleware;
 mod openai;
+mod request_timing;
 mod responses;
 mod router;
 mod structured_output;

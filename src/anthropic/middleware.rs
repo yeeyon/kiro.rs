@@ -1,6 +1,7 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -14,6 +15,7 @@ use crate::admin::client_keys::{KeyAuth, SharedClientKeyManager};
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
+use crate::common::timing::Endpoint;
 use crate::kiro::provider::KiroProvider;
 
 use super::cache_metering::SharedCacheMeter;
@@ -30,6 +32,25 @@ pub struct KeyContext {
     pub key_source: TraceKeySource,
     /// 客户端 IP（转发头优先，回落到 TCP 对端），仅用于请求日志
     pub client_ip: Option<String>,
+    /// When the auth middleware first saw the request, before the body was read.
+    /// Origin of every offset in the request's timing summary.
+    pub received_at: Instant,
+    /// Set by the route's entry handler. Adapters forward it unchanged.
+    pub endpoint: Endpoint,
+}
+
+#[cfg(test)]
+impl KeyContext {
+    pub(crate) fn master() -> Self {
+        Self {
+            key_id: 0,
+            group: None,
+            key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
+            received_at: Instant::now(),
+            endpoint: Endpoint::Other,
+        }
+    }
 }
 
 /// 应用共享状态
@@ -133,6 +154,7 @@ pub async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let received_at = Instant::now();
     let presented = match auth::extract_api_key(&request) {
         Some(k) => k,
         None => {
@@ -151,6 +173,8 @@ pub async fn auth_middleware(
                     group,
                     key_source: TraceKeySource::ClientKey,
                     client_ip,
+                    received_at,
+                    endpoint: Endpoint::Other,
                 });
                 return next.run(request).await;
             }

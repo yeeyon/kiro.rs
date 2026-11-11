@@ -1417,6 +1417,18 @@ pub struct CallContext {
     pub token: String,
     /// 在途请求守卫（Drop 时自动递减凭据的 in_flight 并发计数）
     pub _in_flight: Option<Arc<InFlightGuard>>,
+    /// What this context's token cost to obtain.
+    pub refresh: RefreshTiming,
+}
+
+/// Time a token refresh added to acquiring a [`CallContext`]. Both are zero when the
+/// cached token was still valid.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RefreshTiming {
+    /// Waiting for the refresh lock.
+    pub lock_wait: StdDuration,
+    /// Refreshing and persisting the token while holding the lock.
+    pub refresh: StdDuration,
 }
 
 pub struct IdcReloginCredentials {
@@ -2640,15 +2652,20 @@ impl MultiTokenManager {
                 credentials: credentials.clone(),
                 token,
                 _in_flight: None,
+                refresh: RefreshTiming::default(),
             });
         }
 
         // 第一次检查（无锁）：快速判断是否需要刷新
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        let mut timing = RefreshTiming::default();
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
+            let lock_requested = Instant::now();
             let _guard = self.refresh_lock.lock().await;
+            let lock_acquired = Instant::now();
+            timing.lock_wait = lock_acquired.duration_since(lock_requested);
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -2684,6 +2701,7 @@ impl MultiTokenManager {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
 
+                timing.refresh = lock_acquired.elapsed();
                 merged
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
@@ -2711,6 +2729,7 @@ impl MultiTokenManager {
             credentials: creds,
             token,
             _in_flight: None,
+            refresh: timing,
         })
     }
 

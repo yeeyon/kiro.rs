@@ -32,6 +32,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::admin::trace_db::outcome;
+use crate::common::timing::Decoded;
 use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -44,6 +45,7 @@ use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
     map_provider_error,
 };
+use super::request_timing::tally_event;
 use super::stream::{CompletedToolUse, REFUSAL_STOP_REASON, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
@@ -273,7 +275,7 @@ async fn decode_round(
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
 ) -> RoundOutcome {
-    let mut body_stream = response.bytes_stream();
+    let mut body_stream = tracer.timed_body(response.bytes_stream());
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
@@ -309,6 +311,7 @@ async fn decode_round(
             stream_error = Some(format!("malformed event frame: {e}"));
             break 'read;
         }
+        let mut decoded = Decoded::default();
         for result in decoder.decode_iter() {
             let frame = match result {
                 Ok(f) => f,
@@ -324,6 +327,7 @@ async fn decode_round(
                     break 'read;
                 }
             };
+            tally_event(&mut decoded, &event);
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
                 Event::ReasoningContent(r) => {
@@ -390,6 +394,10 @@ async fn decode_round(
                 _ => {}
             }
         }
+        tracer.record_decoded(&decoded);
+    }
+    if stream_error.is_none() {
+        tracer.mark_upstream_eos();
     }
 
     if !is_refusal(&stop_reason_override) {

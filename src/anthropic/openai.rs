@@ -26,6 +26,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::common::timing::Endpoint;
+
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
 use super::stream::REFUSAL_STOP_REASON;
@@ -115,10 +117,11 @@ pub(super) fn resolve_session_metadata(
 /// `POST /v1/chat/completions`
 pub async fn post_chat_completions(
     State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
+    Extension(mut key_ctx): Extension<KeyContext>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    key_ctx.endpoint = Endpoint::Chat;
     let want_stream = req.stream;
     let model = req.model.clone();
     let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);

@@ -682,12 +682,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
 }
 
 fn key() -> KeyContext {
-    KeyContext {
-        key_id: 0,
-        group: None,
-        key_source: TraceKeySource::MasterApiKey,
-        client_ip: None,
-    }
+    KeyContext::master()
 }
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
     request_with_key(state, endpoint, streaming, key()).await
@@ -1444,30 +1439,53 @@ impl Drop for Routed {
     }
 }
 
+/// One request body that every routed API accepts.
+fn routed_payload(streaming: bool) -> serde_json::Value {
+    json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "stream": streaming,
+        "messages": [{"role": "user", "content": "hello"}],
+        "input": [{"role": "user", "content": "hello"}]
+    })
+}
+
 impl Routed {
-    async fn post(&self, api: &str, streaming: bool) -> reqwest::Response {
+    async fn send(&self, api: &str, payload: serde_json::Value) -> reqwest::Response {
         self.client
             .post(format!("http://{}{api}", self.address))
             .header("x-api-key", ROUTED_KEY)
-            .json(&json!({
-                "model": "gpt-5.6-sol",
-                "max_tokens": 64,
-                "stream": streaming,
-                "messages": [{"role": "user", "content": "hello"}],
-                "input": [{"role": "user", "content": "hello"}]
-            }))
+            .json(&payload)
             .send()
             .await
             .unwrap()
     }
+
+    async fn post(&self, api: &str, streaming: bool) -> reqwest::Response {
+        self.send(api, routed_payload(streaming)).await
+    }
 }
 
-async fn routed(fixture: &Fixture, store: Option<Arc<TraceStore>>) -> Routed {
+async fn routed(
+    fixture: &Fixture,
+    store: Option<Arc<TraceStore>>,
+    extract_thinking: bool,
+) -> Routed {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    routed_on(listener, fixture, store, extract_thinking)
+}
+
+fn routed_on(
+    listener: tokio::net::TcpListener,
+    fixture: &Fixture,
+    store: Option<Arc<TraceStore>>,
+    extract_thinking: bool,
+) -> Routed {
     let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
     keys.sync_system_key("system".into(), None, ROUTED_KEY.into());
     let app = super::router::create_router_with_shared_provider(
         fixture.state.kiro_provider.clone(),
-        false,
+        extract_thinking,
         ToolCompatibilityMode::Raw,
         Some(keys),
         None,
@@ -1476,7 +1494,6 @@ async fn routed(fixture: &Fixture, store: Option<Arc<TraceStore>>) -> Routed {
         store,
         None,
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let client = reqwest::Client::builder()
@@ -1569,6 +1586,291 @@ async fn admin_traces_api_exposes_timing_and_leaves_old_rows_null() {
     }
 }
 
+/// The trace row of the request that just ended.
+async fn next_trace(
+    store: &TraceStore,
+    seen: &mut HashSet<String>,
+) -> crate::admin::trace_db::TraceRecord {
+    for _ in 0..250 {
+        let (records, _) = store.query_paged(&TraceQuery { limit: 100, ..Default::default() });
+        if let Some(record) = records.into_iter().find(|record| !seen.contains(&record.trace_id)) {
+            seen.insert(record.trace_id.clone());
+            return record;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the request wrote no trace row");
+}
+
+async fn read_until(
+    body: &mut (impl futures::Stream<Item = reqwest::Result<Bytes>> + Unpin),
+    received: &mut Vec<u8>,
+    needle: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !String::from_utf8_lossy(received).contains(needle) {
+            let chunk = body.next().await.expect("stream ended before the expected text");
+            received.extend_from_slice(&chunk.unwrap());
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{needle:?} did not reach the client"));
+}
+
+#[tokio::test]
+async fn router_timing_covers_all_apis_stream_and_non_stream() {
+    const EVENTS: usize = 3;
+    let every = Duration::from_millis(30);
+    let f = fixture(Mode::Cadence { events: EVENTS, every }).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed = routed(&f, Some(store.clone()), false).await;
+    let mut seen = HashSet::new();
+    let text_bytes: usize = (0..EVENTS).map(|step| format!("{CADENCE_TEXT}{step} ").len()).sum();
+
+    for (api, label) in ROUTED_APIS.into_iter().zip(["messages", "cc", "chat", "responses"]) {
+        for streaming in [true, false] {
+            let case = format!("{api} stream={streaming}");
+            let response = routed.post(api, streaming).await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            let body = response.text().await.unwrap();
+            assert!(body.contains(&format!("{CADENCE_TEXT}{}", EVENTS - 1)), "{case}: {body}");
+
+            let record = next_trace(&store, &mut seen).await;
+            assert_eq!(record.endpoint.as_deref(), Some(label), "{case}");
+            assert_eq!(record.is_stream, streaming, "{case}");
+            assert_eq!(record.first_token_ms.is_some(), streaming, "{case}");
+            assert_eq!(record.output_tokens, 17, "{case}");
+            assert_eq!(record.output_tokens_source.as_deref(), Some("exact"), "{case}");
+
+            let timing = record.timing.unwrap_or_else(|| panic!("{case}: no timing"));
+            let phases = &timing.phases;
+            let stream = timing.stream.as_ref().unwrap_or_else(|| panic!("{case}: no stream"));
+            let mut order = vec![
+                phases.body_parsed_us,
+                phases.prepared_us,
+                phases.upstream_headers_us,
+                phases.first_body_bytes_us,
+                phases.first_decoded_content_us,
+            ];
+            if streaming {
+                order.push(phases.first_emit_text_us);
+            } else {
+                assert_eq!(phases.first_emit_text_us, None, "{case}");
+            }
+            order.extend([
+                stream.last_content_us,
+                stream.final_usage_us,
+                stream.upstream_eos_us,
+                Some(timing.total_us),
+            ]);
+            assert!(order.iter().all(Option::is_some), "{case}: {order:?}");
+            assert!(order.is_sorted(), "{case}: {order:?}");
+            assert_eq!((phases.first_emit_thinking_us, phases.first_emit_tool_us), (None, None), "{case}");
+
+            assert_eq!(stream.upstream_calls, 1, "{case}");
+            assert_eq!(
+                (stream.text.events as usize, stream.text.bytes as usize),
+                (EVENTS, text_bytes),
+                "{case}"
+            );
+            assert_eq!(stream.thinking.events + stream.tool.events, 0, "{case}");
+            assert_eq!(stream.frames_per_chunk.sum as usize, EVENTS + 1, "{case}");
+            assert_eq!(stream.content_emits > 0, streaming, "{case}");
+            let spaced = (every * (EVENTS as u32 - 1)).as_micros() as u64;
+            assert!(stream.generation.window_us >= spaced * 3 / 4, "{case}: {stream:?}");
+            assert!(stream.upstream_wait_us >= spaced, "{case}: {stream:?}");
+
+            let spans = &timing.spans;
+            assert_eq!(
+                (spans.credential_select.count, spans.headers_wait.count, spans.backoff.count),
+                (1, 1, 0),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn router_timing_separates_thinking_from_text() {
+    const REASONING: &str = "Let me think about the goal.";
+    let f = fixture(Mode::ReplyWithReasoning(&["answer"])).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed = routed(&f, Some(store.clone()), true).await;
+    let mut seen = HashSet::new();
+    for streaming in [true, false] {
+        let mut payload = routed_payload(streaming);
+        payload["thinking"] = json!({"type": "enabled", "budget_tokens": 2000});
+        let body = routed.send("/v1/messages", payload).await.text().await.unwrap();
+        assert!(body.contains(REASONING) && body.contains("answer"), "{body}");
+
+        let timing = next_trace(&store, &mut seen).await.timing.unwrap();
+        let stream = timing.stream.unwrap();
+        assert_eq!((stream.thinking.events, stream.thinking.bytes as usize), (1, REASONING.len()));
+        assert_eq!((stream.text.events, stream.text.bytes), (1, 6));
+        assert_eq!(stream.generation.events, 2);
+        let (thinking, text) = (timing.phases.first_emit_thinking_us, timing.phases.first_emit_text_us);
+        if streaming {
+            assert!(thinking.is_some() && thinking <= text, "{thinking:?} {text:?}");
+        } else {
+            assert_eq!((thinking, text), (None, None));
+        }
+    }
+}
+
+/// Also guards the Responses adapter: the first text must reach the client while the
+/// upstream is still holding the rest.
+#[tokio::test]
+async fn router_timing_counts_a_gated_upstream_as_upstream_wait() {
+    let gate = Duration::from_millis(250);
+    let f = fixture(Mode::GatedChatText).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed = routed(&f, Some(store.clone()), false).await;
+
+    let mut body = routed.post("/v1/responses", true).await.bytes_stream();
+    let mut received = Vec::new();
+    read_until(&mut body, &mut received, "first streamed paragraph").await;
+    assert!(!String::from_utf8_lossy(&received).contains("second streamed paragraph"));
+    tokio::time::sleep(gate).await;
+    f.release_tool_arguments.notify_one();
+    read_until(&mut body, &mut received, "second streamed paragraph").await;
+    f.release_tool_arguments.notify_one();
+    while let Some(chunk) = body.next().await {
+        chunk.unwrap();
+    }
+
+    let timing = next_trace(&store, &mut HashSet::new()).await.timing.unwrap();
+    let stream = timing.stream.unwrap();
+    let gate_us = gate.as_micros() as u64;
+    assert!(stream.receive_gaps.max >= gate_us, "{stream:?}");
+    assert!(stream.emit_gaps.max >= gate_us, "{stream:?}");
+    assert!(stream.upstream_wait_us >= gate_us, "{stream:?}");
+    assert!(stream.downstream_wait.total_us < gate_us / 2, "{stream:?}");
+}
+
+#[tokio::test]
+async fn router_timing_counts_a_slow_reader_as_downstream_wait() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pause = Duration::from_millis(1500);
+    let f = fixture(Mode::Large).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+
+    // Small socket buffers on both ends, so the pause pushes back on the gateway
+    // instead of being absorbed by the kernel.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_send_buffer_size(4096).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let routed = routed_on(socket.listen(16).unwrap(), &f, Some(store.clone()), false);
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut client = socket.connect(routed.address).await.unwrap();
+    let payload = routed_payload(true).to_string();
+    let request = format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: gateway\r\nx-api-key: {ROUTED_KEY}\r\n\
+         content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut buffer = vec![0u8; 64 * 1024];
+    assert!(client.read(&mut buffer).await.unwrap() > 0);
+    tokio::time::sleep(pause).await;
+    // Read past everything that was buffered, so the gateway asks upstream for more
+    // and the wait is recorded. Then hang up: the rest of the body adds nothing.
+    let mut resumed = 0;
+    while resumed < 4 * 1024 * 1024 {
+        resumed += client.read(&mut buffer).await.unwrap();
+    }
+    drop(client);
+
+    let timing = next_trace(&store, &mut HashSet::new()).await.timing.unwrap();
+    let stream = timing.stream.unwrap();
+    // One long wait, not many short ones: only a stalled reader produces it.
+    assert!(
+        stream.downstream_wait.max_us >= pause.as_micros() as u64 / 3,
+        "{stream:?}"
+    );
+}
+
+#[tokio::test]
+async fn router_timing_names_an_estimated_token_source() {
+    let f = fixture(Mode::NoProviderUsage).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed = routed(&f, Some(store.clone()), false).await;
+    let mut seen = HashSet::new();
+    for (api, streaming) in [("/v1/messages", true), ("/v1/chat/completions", false)] {
+        assert_eq!(routed.post(api, streaming).await.status(), StatusCode::OK);
+        let record = next_trace(&store, &mut seen).await;
+        assert_eq!(record.output_tokens_source.as_deref(), Some("estimated"), "{api}");
+        assert_eq!(record.timing.unwrap().stream.unwrap().final_usage_us, None, "{api}");
+    }
+
+    let records = admin_traces(&f, store).await;
+    assert_eq!(records.len(), 2);
+    for record in &records {
+        assert_eq!(record["outputTokensSource"], "estimated");
+        assert_eq!(record["throughput"]["outputTokensSource"], "estimated");
+        assert!(record["throughput"]["outputTps"].is_null(), "{record}");
+        assert_eq!(record["timing"]["stream"]["text"]["bytes"], 2);
+    }
+    let mut endpoints: Vec<_> = records.iter().map(|record| record["endpoint"].as_str().unwrap()).collect();
+    endpoints.sort_unstable();
+    assert_eq!(endpoints, ["chat", "messages"]);
+}
+
+#[tokio::test]
+async fn router_timing_keeps_provider_spans_when_the_upstream_fails() {
+    let f = fixture(Mode::Overloaded).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed = routed(&f, Some(store.clone()), false).await;
+    let mut seen = HashSet::new();
+    for streaming in [true, false] {
+        let response = routed.post("/v1/messages", streaming).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let record = next_trace(&store, &mut seen).await;
+        assert_eq!(record.final_status, "error");
+        assert_eq!(record.output_tokens_source.as_deref(), Some("unavailable"));
+        let timing = record.timing.unwrap();
+        assert_eq!(timing.stream, None);
+        assert_eq!(timing.phases.upstream_headers_us, None);
+        assert!(timing.phases.prepared_us.is_some());
+        let spans = &timing.spans;
+        assert_eq!(
+            (spans.credential_select.count, spans.headers_wait.count, spans.error_body_read.count),
+            (1, 1, 1)
+        );
+        assert!(spans.headers_wait.total_us > 0);
+    }
+}
+
+#[tokio::test]
+async fn router_timing_is_written_for_interrupted_and_abandoned_streams() {
+    let f = fixture(Mode::Interrupted).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed_gateway = routed(&f, Some(store.clone()), false).await;
+    let body = routed_gateway.post("/cc/v1/messages", true).await.text().await.unwrap();
+    assert!(body.contains("early content") && body.contains("event: error"), "{body}");
+    let record = next_trace(&store, &mut HashSet::new()).await;
+    assert_eq!(record.error_type.as_deref(), Some("stream_interrupted"));
+    assert_eq!(record.output_tokens_source.as_deref(), Some("estimated"));
+    let timing = record.timing.unwrap();
+    assert!(timing.phases.first_emit_text_us.is_some());
+    let stream = timing.stream.unwrap();
+    assert_eq!((stream.chunks, stream.upstream_eos_us), (1, None));
+
+    let f = fixture(Mode::Stalled).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed_gateway = routed(&f, Some(store.clone()), false).await;
+    let mut body = routed_gateway.post("/v1/messages", true).await.bytes_stream();
+    read_until(&mut body, &mut Vec::new(), "early content").await;
+    drop(body);
+    let record = next_trace(&store, &mut HashSet::new()).await;
+    assert_eq!(record.final_status, "interrupted");
+    let timing = record.timing.unwrap();
+    assert!(timing.phases.first_emit_text_us.is_some());
+    assert_eq!(timing.stream.unwrap().upstream_eos_us, None);
+}
+
 fn percentile(samples: &mut [f64], q: f64) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples[((samples.len() - 1) as f64 * q).round() as usize]
@@ -1610,7 +1912,7 @@ async fn gateway_router_cadence_measurement() {
     const EVERY: Duration = Duration::from_millis(5);
     let f = fixture(Mode::Cadence { events: EVENTS, every: EVERY }).await;
     let store = Arc::new(TraceStore::open_in_memory().unwrap());
-    let routed = routed(&f, Some(store)).await;
+    let routed = routed(&f, Some(store), false).await;
     for api in ROUTED_APIS {
         for _ in 0..WARMUP {
             measure_stream(&routed, api).await;

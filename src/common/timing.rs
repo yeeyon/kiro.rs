@@ -542,8 +542,10 @@ pub struct PhaseSummary {
     pub first_emit_tool_us: Option<Micros>,
 }
 
+/// Exhaustive on purpose: a new phase without a summary field does not compile.
+#[cfg(test)]
 impl PhaseSummary {
-    pub fn get(&self, phase: Phase) -> Option<Micros> {
+    fn get(&self, phase: Phase) -> Option<Micros> {
         match phase {
             Phase::BodyParsed => self.body_parsed_us,
             Phase::Prepared => self.prepared_us,
@@ -569,8 +571,9 @@ pub struct SpanSummary {
     pub backoff: SpanStat,
 }
 
+#[cfg(test)]
 impl SpanSummary {
-    pub fn get(&self, span: Span) -> SpanStat {
+    fn get(&self, span: Span) -> SpanStat {
         match span {
             Span::CredentialSelect => self.credential_select,
             Span::RefreshLockWait => self.refresh_lock_wait,
@@ -625,10 +628,15 @@ pub struct StreamSummary {
     pub tool: WindowStat,
 }
 
-/// Rates derived from a summary on read. Never stored.
+/// Rates and gap quantiles derived from a summary on read. Never stored.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Throughput {
+    /// Upper bound of the histogram bucket that holds the quantile, not an exact value.
+    pub emit_gap_p50_us: Option<u64>,
+    pub emit_gap_p95_us: Option<u64>,
+    pub receive_gap_p50_us: Option<u64>,
+    pub receive_gap_p95_us: Option<u64>,
     /// Output tokens per second of generation window. The token count covers thinking,
     /// text and tool arguments together. Tokens of the first event were generated
     /// before the window opens, so short responses read slightly high.
@@ -650,7 +658,14 @@ impl Summary {
                 .then(|| amount as f64 * 1_000_000.0 / window.window_us as f64)
         };
         let stream = self.stream.as_ref();
+        let gap = |gaps: fn(&StreamSummary) -> &Histogram, q: f64| {
+            stream.and_then(|stream| gaps(stream).quantile_upper_bound(Scale::GapMicros, q))
+        };
         Throughput {
+            emit_gap_p50_us: gap(|stream| &stream.emit_gaps, 0.5),
+            emit_gap_p95_us: gap(|stream| &stream.emit_gaps, 0.95),
+            receive_gap_p50_us: gap(|stream| &stream.receive_gaps, 0.5),
+            receive_gap_p95_us: gap(|stream| &stream.receive_gaps, 0.95),
             output_tps: stream
                 .zip(tokens.count())
                 .and_then(|(stream, count)| rate(count, stream.generation)),
@@ -758,7 +773,10 @@ mod tests {
         ledger.emitted(2_040, &emitted);
         ledger.upstream_eos(2_100);
 
-        let stream = ledger.summarize(2_200).stream.unwrap();
+        let summary = ledger.summarize(2_200);
+        let derived = summary.throughput(OutputTokens::Unavailable);
+        assert_eq!((derived.receive_gap_p50_us, derived.emit_gap_p95_us), (Some(620), Some(620)));
+        let stream = summary.stream.unwrap();
         assert_eq!((stream.chunks, stream.bytes), (2, 20));
         assert_eq!(stream.upstream_wait_us, 400 + 300);
         assert_eq!(stream.downstream_wait, SpanStat { total_us: 300, count: 1, max_us: 300 });

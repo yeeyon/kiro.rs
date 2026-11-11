@@ -47,6 +47,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::common::timing::Endpoint;
+
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
 use super::openai::{
@@ -216,10 +218,11 @@ impl ResponsesResponseConfig {
 /// `POST /v1/responses`
 pub async fn post_responses(
     State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
+    Extension(mut key_ctx): Extension<KeyContext>,
     headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
+    key_ctx.endpoint = Endpoint::Responses;
     let operation = match compaction::classify(&req.input) {
         Ok(operation) => operation,
         Err(message) => {

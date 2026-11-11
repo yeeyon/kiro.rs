@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
+use crate::common::timing::Span;
 use crate::http_client::{ProxyConfig, build_client_with_timeouts};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::{
@@ -831,11 +832,12 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
-            let mut ctx = match self
+            let acquired = self
                 .token_manager
                 .acquire_context_routed(model.as_deref(), group, session_id.as_deref())
-                .await
-            {
+                .await;
+            Self::report_acquire(sink, attempt_start.elapsed(), acquired.as_ref().ok());
+            let mut ctx = match acquired {
                 Ok((c, route)) => {
                     // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
                     // 刚发生的失败影响，不代表会话层面的粘性效果。
@@ -882,7 +884,10 @@ impl KiroProvider {
             };
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
-            if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
+            let profile_started = Instant::now();
+            let profile = self.ensure_profile_arn(&mut ctx).await;
+            Self::report_span(sink, Span::ProfileResolve, profile_started);
+            if let Err(e) = profile {
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -943,7 +948,10 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
-            let response = match client.execute(request).await {
+            let sent = Instant::now();
+            let executed = client.execute(request).await;
+            Self::report_span(sink, Span::HeadersWait, sent);
+            let response = match executed {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -974,7 +982,7 @@ impl KiroProvider {
 
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                        Self::backoff(sink, Self::retry_delay(attempt)).await;
                     }
                     continue;
                 }
@@ -986,6 +994,9 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                if let Some(sink) = sink {
+                    sink.on_upstream_call();
+                }
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::SUCCESS, None, attempt_start,
@@ -1005,7 +1016,10 @@ impl KiroProvider {
 
             let retry_after = UpstreamRateLimitError::from_headers(response.headers());
             // 失败响应：读取 body 用于日志/错误信息
-            let body = match response.text().await {
+            let body_started = Instant::now();
+            let body_read = response.text().await;
+            Self::report_span(sink, Span::ErrorBodyRead, body_started);
+            let body = match body_read {
                 Ok(body) => body,
                 Err(error) => {
                     Self::emit_attempt(
@@ -1150,9 +1164,10 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if Self::handle_force_refresh_result(
-                        self.token_manager.force_refresh_token_for(ctx.id).await,
-                    )? {
+                    let refresh_started = Instant::now();
+                    let refreshed = self.token_manager.force_refresh_token_for(ctx.id).await;
+                    Self::report_span(sink, Span::TokenRefresh, refresh_started);
+                    if Self::handle_force_refresh_result(refreshed)? {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -1326,7 +1341,7 @@ impl KiroProvider {
                     } else {
                         Self::retry_delay(attempt)
                     };
-                    sleep(delay).await;
+                    Self::backoff(sink, delay).await;
                 }
                 continue;
             }
@@ -1359,7 +1374,7 @@ impl KiroProvider {
                 body
             ));
             if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt)).await;
+                Self::backoff(sink, Self::retry_delay(attempt)).await;
             }
         }
 
@@ -1371,6 +1386,39 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    fn report_span(sink: Option<&dyn TraceSink>, span: Span, started: Instant) {
+        if let Some(sink) = sink {
+            sink.on_span(span, started.elapsed());
+        }
+    }
+
+    /// Split the time spent acquiring a call context into credential selection and
+    /// token refresh. A failed acquire has no split, so all of it counts as selection.
+    fn report_acquire<R>(
+        sink: Option<&dyn TraceSink>,
+        elapsed: Duration,
+        acquired: Option<&(crate::kiro::token_manager::CallContext, R)>,
+    ) {
+        let Some(sink) = sink else { return };
+        let refresh = acquired.map(|(ctx, _)| ctx.refresh).unwrap_or_default();
+        if !refresh.lock_wait.is_zero() {
+            sink.on_span(Span::RefreshLockWait, refresh.lock_wait);
+        }
+        if !refresh.refresh.is_zero() {
+            sink.on_span(Span::TokenRefresh, refresh.refresh);
+        }
+        sink.on_span(
+            Span::CredentialSelect,
+            elapsed.saturating_sub(refresh.lock_wait + refresh.refresh),
+        );
+    }
+
+    async fn backoff(sink: Option<&dyn TraceSink>, delay: Duration) {
+        let started = Instant::now();
+        sleep(delay).await;
+        Self::report_span(sink, Span::Backoff, started);
     }
 
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
