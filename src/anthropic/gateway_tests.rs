@@ -1620,7 +1620,7 @@ async fn read_until(
 #[tokio::test]
 async fn router_timing_covers_all_apis_stream_and_non_stream() {
     const EVENTS: usize = 3;
-    let every = Duration::from_millis(30);
+    let every = Duration::from_millis(80);
     let f = fixture(Mode::Cadence { events: EVENTS, every }).await;
     let store = Arc::new(TraceStore::open_in_memory().unwrap());
     let routed = routed(&f, Some(store.clone()), false).await;
@@ -1678,7 +1678,7 @@ async fn router_timing_covers_all_apis_stream_and_non_stream() {
             assert_eq!(stream.content_emits > 0, streaming, "{case}");
             let spaced = (every * (EVENTS as u32 - 1)).as_micros() as u64;
             assert!(stream.generation.window_us >= spaced * 3 / 4, "{case}: {stream:?}");
-            assert!(stream.upstream_wait_us >= spaced, "{case}: {stream:?}");
+            assert!(stream.upstream_wait_us >= spaced * 3 / 4, "{case}: {stream:?}");
 
             let spans = &timing.spans;
             assert_eq!(
@@ -1776,10 +1776,16 @@ async fn router_timing_counts_a_slow_reader_as_downstream_wait() {
     tokio::time::sleep(pause).await;
     // Read past everything that was buffered, so the gateway asks upstream for more
     // and the wait is recorded. Then hang up: the rest of the body adds nothing.
-    let mut resumed = 0;
-    while resumed < 4 * 1024 * 1024 {
-        resumed += client.read(&mut buffer).await.unwrap();
-    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut resumed = 0;
+        while resumed < 4 * 1024 * 1024 {
+            let read = client.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the gateway closed the connection after {resumed} bytes");
+            resumed += read;
+        }
+    })
+    .await
+    .expect("the gateway stopped sending before the reader resumed");
     drop(client);
 
     let timing = next_trace(&store, &mut HashSet::new()).await.timing.unwrap();
@@ -1789,6 +1795,27 @@ async fn router_timing_counts_a_slow_reader_as_downstream_wait() {
         stream.downstream_wait.max_us >= pause.as_micros() as u64 / 3,
         "{stream:?}"
     );
+}
+
+#[tokio::test]
+async fn router_timing_counts_content_decoded_in_the_chunk_that_fails() {
+    let f = fixture(Mode::Throttled).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed = routed(&f, Some(store.clone()), false).await;
+    let mut seen = HashSet::new();
+    for streaming in [true, false] {
+        routed.post("/v1/messages", streaming).await.bytes().await.unwrap();
+        let timing = next_trace(&store, &mut seen).await.timing.unwrap();
+        let phases = &timing.phases;
+        assert!(phases.first_decoded_content_us.is_some(), "stream={streaming}: {phases:?}");
+        if streaming {
+            assert!(
+                phases.first_decoded_content_us <= phases.first_emit_text_us,
+                "{phases:?}"
+            );
+        }
+        assert_eq!(timing.stream.unwrap().text.events, 1, "stream={streaming}");
+    }
 }
 
 #[tokio::test]
