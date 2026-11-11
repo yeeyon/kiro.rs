@@ -1436,6 +1436,8 @@ fn create_sse_stream(
 
                             let mut events = Vec::new();
                             let mut decoded = Decoded::default();
+                            // Content decoded before a failure in the same chunk still counts.
+                            let mut halt: Option<(StreamFailure, String)> = None;
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
@@ -1443,8 +1445,8 @@ fn create_sse_stream(
                                             Ok(event) => {
                                                 tally_event(&mut decoded, &event);
                                                 if let Some((error, failure)) = upstream_event_error(&event) {
-                                                    let bytes = settlement.interrupt(&mut ctx, events, &failure, &error, sent_bytes);
-                                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                                    halt = Some((failure, error));
+                                                    break;
                                                 }
                                                 let generated = ctx.process_kiro_event(&event);
                                                 // 结构化模式下内容被缓冲，首字时间在流末真正发出时再记
@@ -1454,19 +1456,23 @@ fn create_sse_stream(
                                                 events.extend(generated);
                                             }
                                             Err(error) => {
-                                                let bytes = settlement.interrupt(&mut ctx, events, &StreamFailure::interrupted("malformed event frame from upstream"), &error.to_string(), sent_bytes);
-                                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                                halt = Some((StreamFailure::interrupted("malformed event frame from upstream"), error.to_string()));
+                                                break;
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        let bytes = settlement.interrupt(&mut ctx, events, &StreamFailure::interrupted("malformed event frame from upstream"), &e.to_string(), sent_bytes);
-                                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                        halt = Some((StreamFailure::interrupted("malformed event frame from upstream"), e.to_string()));
+                                        break;
                                     }
                                 }
                             }
 
                             settlement.tracer.record_decoded(&decoded);
+                            if let Some((failure, error)) = halt {
+                                let bytes = settlement.interrupt(&mut ctx, events, &failure, &error, sent_bytes);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                            }
                             let events = settlement.hold_if_structured(events);
                             let bytes = settlement.emit(events);
                             settlement.update(&ctx, sent_bytes);
@@ -2044,32 +2050,22 @@ pub(crate) async fn execute_non_stream_request(
             ));
         }
         let mut decoded = Decoded::default();
+        // Content decoded before a failure in the same chunk still counts.
+        let mut halt: Option<(String, StreamFailure)> = None;
         for result in decoder.decode_iter() {
             match result {
                 Ok(frame) => {
                     let event = match Event::from_frame(frame) {
                         Ok(event) => event,
                         Err(e) => {
-                            return Err(non_stream_read_failure(
-                                &hook,
-                                &tracer,
-                                credential_id,
-                                input_tokens,
-                                &e.to_string(),
-                                StreamFailure::interrupted("malformed event frame from upstream"),
-                            ));
+                            halt = Some((e.to_string(), StreamFailure::interrupted("malformed event frame from upstream")));
+                            break;
                         }
                     };
                     tally_event(&mut decoded, &event);
-                    if let Some((error, failure)) = upstream_event_error(&event) {
-                        return Err(non_stream_read_failure(
-                            &hook,
-                            &tracer,
-                            credential_id,
-                            input_tokens,
-                            &error,
-                            failure,
-                        ));
+                    if let Some(upstream_error) = upstream_event_error(&event) {
+                        halt = Some(upstream_error);
+                        break;
                     }
                     {
                         match event {
@@ -2164,18 +2160,22 @@ pub(crate) async fn execute_non_stream_request(
                     }
                 }
                 Err(e) => {
-                    return Err(non_stream_read_failure(
-                        &hook,
-                        &tracer,
-                        credential_id,
-                        input_tokens,
-                        &e.to_string(),
-                        StreamFailure::interrupted("malformed event frame from upstream"),
-                    ));
+                    halt = Some((e.to_string(), StreamFailure::interrupted("malformed event frame from upstream")));
+                    break;
                 }
             }
         }
         tracer.record_decoded(&decoded);
+        if let Some((error, failure)) = halt {
+            return Err(non_stream_read_failure(
+                &hook,
+                &tracer,
+                credential_id,
+                input_tokens,
+                &error,
+                failure,
+            ));
+        }
     }
 
     if !received_data || decoder.has_pending_data() {

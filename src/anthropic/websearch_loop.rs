@@ -312,19 +312,20 @@ async fn decode_round(
             break 'read;
         }
         let mut decoded = Decoded::default();
-        for result in decoder.decode_iter() {
+        // Breaking out of this loop still records what the chunk decoded before it failed.
+        'frames: for result in decoder.decode_iter() {
             let frame = match result {
                 Ok(f) => f,
                 Err(e) => {
                     stream_error = Some(format!("malformed event frame: {e}"));
-                    break 'read;
+                    break 'frames;
                 }
             };
             let event = match Event::from_frame(frame) {
                 Ok(ev) => ev,
                 Err(e) => {
                     stream_error = Some(format!("malformed event: {e}"));
-                    break 'read;
+                    break 'frames;
                 }
             };
             tally_event(&mut decoded, &event);
@@ -381,7 +382,7 @@ async fn decode_round(
                     } else {
                         // L10：与普通流式路径一致，上游异常让本轮失败，不当成正常结束。
                         stream_error = Some(format!("upstream exception {exception_type}: {message}"));
-                        break 'read;
+                        break 'frames;
                     }
                 }
                 Event::Error {
@@ -389,14 +390,17 @@ async fn decode_round(
                     error_message,
                 } => {
                     stream_error = Some(format!("upstream error {error_code}: {error_message}"));
-                    break 'read;
+                    break 'frames;
                 }
                 _ => {}
             }
         }
         tracer.record_decoded(&decoded);
+        if stream_error.is_some() {
+            break;
+        }
     }
-    if stream_error.is_none() {
+    if stream_error.is_none() && !decoder.has_pending_data() {
         tracer.mark_upstream_eos();
     }
 
