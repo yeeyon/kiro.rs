@@ -294,3 +294,48 @@ nothing about the real Kiro upstream.
 cargo test --locked gateway_router_cadence_measurement -- --ignored --nocapture
 cargo test --locked router_timing
 ```
+
+## TCP_NODELAY on client sockets
+
+**Finding.** The 40 ms gap above came from the listener. The gateway did not
+set `TCP_NODELAY` on accepted client sockets, so Nagle's algorithm plus the
+client's delayed ACK held small SSE writes for about 40 ms. With the fixture
+sending 8 text events 5 ms apart, the P50 of the longest client-side gap was:
+
+| Fixture socket | Gateway socket | Gap max P50 | Total P50 |
+| --- | --- | ---: | ---: |
+| default | default | 43 ms | about 54 ms |
+| `TCP_NODELAY` | default | 42 ms | about 54 ms |
+| default | `TCP_NODELAY` | 42 ms | about 54 ms |
+| `TCP_NODELAY` | `TCP_NODELAY` | 7 ms | about 54 ms |
+
+Both sockets need the option in this fixture, because each hop stalls on its
+own. Total time did not change; only the evenness of the chunks did.
+
+**Change.** `common::net::nodelay_listener` wraps the `TcpListener` and sets
+`TCP_NODELAY` on every accepted socket. A failure is logged as a warning and the
+connection is kept. `main.rs` serves through it, with connect info still in
+place for the client IP fallback. The router tests serve through the same
+function, and the upstream fixture listener sets the option too, so the bench
+measures the gateway rather than the fixture. `router_streams_small_events_without_nagle_stalls`
+asserts the median longest chunk gap stays under 30 ms for a 10 ms cadence on
+all four APIs.
+
+**After.** Same bench, 200 requests per API, debug build, Docker Linux on a Windows host,
+November 11, 2026, one run:
+
+| API | Gap max P50 | Gap max P95 | Total P50 |
+| --- | ---: | ---: | ---: |
+| `/v1/messages` | 7.01 ms | 7.72 ms | 55.08 ms |
+| `/cc/v1/messages` | 6.89 ms | 7.53 ms | 55.20 ms |
+| `/v1/chat/completions` | 7.08 ms | 7.72 ms | 57.95 ms |
+| `/v1/responses` | 7.67 ms | 8.98 ms | 56.42 ms |
+
+The longest gap fell from about 43 ms to about 7 ms on every API. Total time is
+within run-to-run spread of the earlier 54 ms. With the option removed, the new
+test failed with medians near 42 ms.
+
+**Limitations.** Measured on a loopback Linux fixture only. The effect on a real
+network is unmeasured. Windows delays ACKs by up to 200 ms by default, so the
+stall may be larger there, which is also unmeasured. The gateway's connection to
+the real Kiro upstream is a separate hop and is not changed here.
