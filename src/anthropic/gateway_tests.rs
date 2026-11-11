@@ -86,6 +86,8 @@ enum Mode {
     /// 只有正文、没有 metadataEvent.tokenUsage：线上 Kiro 对 claude-opus/sonnet-5.5 的实际形态
     /// （traces.db 里 usage_source 全是 none），缓存用量只能来自本地 CacheMeter。
     NoProviderUsage,
+    /// `events` text deltas, one frame per chunk, `every` apart, then metadataEvent.
+    Cadence { events: usize, every: Duration },
 }
 
 struct Fixture {
@@ -587,6 +589,19 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
                 ] { bytes.extend_from_slice(&part); }
                 return Response::new(Body::from(bytes));
+            }
+            if let Mode::Cadence { events, every } = mode {
+                let chunks = stream::unfold(0, move |step| async move {
+                    if step > events { return None; }
+                    if step > 0 { tokio::time::sleep(every).await; }
+                    let chunk = if step == events {
+                        frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}}))
+                    } else {
+                        frame("assistantResponseEvent", json!({"content": format!("{CADENCE_TEXT}{step} ")}))
+                    };
+                    Some((Ok::<_, Infallible>(chunk), step + 1))
+                });
+                return Response::new(Body::from_stream(chunks));
             }
             if matches!(mode, Mode::NoProviderUsage) {
                 return Response::new(Body::from(frame("assistantResponseEvent", json!({"content": "ok"}))));
@@ -1403,6 +1418,139 @@ async fn gateway_latency_measurement() {
             total[5],
             f.connections.lock().len(),
             f.calls.load(Ordering::Relaxed)
+        );
+    }
+}
+
+const CADENCE_TEXT: &str = "cadence-";
+const ROUTED_KEY: &str = "fixture-system-key";
+const ROUTED_APIS: [&str; 4] = [
+    "/v1/messages",
+    "/cc/v1/messages",
+    "/v1/chat/completions",
+    "/v1/responses",
+];
+
+/// The production router on a real socket, in front of the upstream fixture.
+struct Routed {
+    address: SocketAddr,
+    client: reqwest::Client,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Routed {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl Routed {
+    async fn post(&self, api: &str, streaming: bool) -> reqwest::Response {
+        self.client
+            .post(format!("http://{}{api}", self.address))
+            .header("x-api-key", ROUTED_KEY)
+            .json(&json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "stream": streaming,
+                "messages": [{"role": "user", "content": "hello"}],
+                "input": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+async fn routed(fixture: &Fixture, store: Option<Arc<TraceStore>>) -> Routed {
+    let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    keys.sync_system_key("system".into(), None, ROUTED_KEY.into());
+    let app = super::router::create_router_with_shared_provider(
+        fixture.state.kiro_provider.clone(),
+        false,
+        ToolCompatibilityMode::Raw,
+        Some(keys),
+        None,
+        None,
+        None,
+        store,
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    Routed { address, client, server }
+}
+
+fn percentile(samples: &mut [f64], q: f64) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[((samples.len() - 1) as f64 * q).round() as usize]
+}
+
+/// Client-side view of one streamed request: ms to the first text chunk, ms to
+/// the end of the body, and the longest wait between two text chunks.
+async fn measure_stream(routed: &Routed, api: &str) -> (f64, f64, f64) {
+    let start = Instant::now();
+    let mut body = routed.post(api, true).await.bytes_stream();
+    let mut first_text = None;
+    let mut last_text = start;
+    let mut gap_max = Duration::ZERO;
+    while let Some(chunk) = body.next().await {
+        if !String::from_utf8_lossy(&chunk.unwrap()).contains(CADENCE_TEXT) {
+            continue;
+        }
+        let now = Instant::now();
+        if first_text.is_some() {
+            gap_max = gap_max.max(now - last_text);
+        }
+        first_text.get_or_insert(now - start);
+        last_text = now;
+    }
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    (
+        ms(first_text.expect("stream carried no text")),
+        ms(start.elapsed()),
+        ms(gap_max),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled latency measurement; run with --ignored --nocapture"]
+async fn gateway_router_cadence_measurement() {
+    const WARMUP: usize = 10;
+    const REQUESTS: usize = 200;
+    const EVENTS: usize = 8;
+    const EVERY: Duration = Duration::from_millis(5);
+    let f = fixture(Mode::Cadence { events: EVENTS, every: EVERY }).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let routed = routed(&f, Some(store)).await;
+    for api in ROUTED_APIS {
+        for _ in 0..WARMUP {
+            measure_stream(&routed, api).await;
+        }
+        let (mut first, mut total, mut gap) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..REQUESTS {
+            let (f, t, g) = measure_stream(&routed, api).await;
+            first.push(f);
+            total.push(t);
+            gap.push(g);
+        }
+        println!(
+            "CADENCE api={api} requests={REQUESTS} events={EVENTS} every_ms={} \
+             first_text_p50_ms={:.3} first_text_p95_ms={:.3} total_p50_ms={:.3} \
+             total_p95_ms={:.3} gap_max_p50_ms={:.3} gap_max_p95_ms={:.3}",
+            EVERY.as_millis(),
+            percentile(&mut first, 0.5),
+            percentile(&mut first, 0.95),
+            percentile(&mut total, 0.5),
+            percentile(&mut total, 0.95),
+            percentile(&mut gap, 0.5),
+            percentile(&mut gap, 0.95),
         );
     }
 }
