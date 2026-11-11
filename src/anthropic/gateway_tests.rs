@@ -655,7 +655,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
         axum::serve(
-            listener,
+            crate::common::net::nodelay_listener(listener),
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
@@ -1495,7 +1495,11 @@ fn routed_on(
         None,
     );
     let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let server = tokio::spawn(async move {
+        axum::serve(crate::common::net::nodelay_listener(listener), app)
+            .await
+            .unwrap()
+    });
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(30))
@@ -1928,6 +1932,26 @@ async fn measure_stream(routed: &Routed, api: &str) -> (f64, f64, f64) {
         ms(start.elapsed()),
         ms(gap_max),
     )
+}
+
+/// Without TCP_NODELAY on the accepted socket, Nagle plus the client's delayed
+/// ACK hold small SSE writes for about 40 ms, so the median of the per-request
+/// longest gap lands near 43 ms for a 5 ms upstream cadence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn router_streams_small_events_without_nagle_stalls() {
+    const EVERY: Duration = Duration::from_millis(10);
+    const BOUND_MS: f64 = 30.0;
+    let f = fixture(Mode::Cadence { events: 8, every: EVERY }).await;
+    let routed = routed(&f, None, false).await;
+    for api in ROUTED_APIS {
+        measure_stream(&routed, api).await;
+        let mut gaps = Vec::new();
+        for _ in 0..7 {
+            gaps.push(measure_stream(&routed, api).await.2);
+        }
+        let median = percentile(&mut gaps, 0.5);
+        assert!(median < BOUND_MS, "{api}: median max chunk gap {median:.1} ms, all {gaps:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

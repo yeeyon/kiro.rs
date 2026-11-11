@@ -465,7 +465,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     // with_connect_info：把 TCP 对端地址注入请求扩展，直连部署下作为客户端 IP 的兜底
     axum::serve(
-        listener,
+        common::net::nodelay_listener(listener),
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
